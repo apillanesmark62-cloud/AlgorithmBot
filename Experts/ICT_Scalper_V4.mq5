@@ -39,9 +39,38 @@ input int    NewYorkEndHour          = 17;
 
 input ulong  MagicNumber             = 26082904;
 
+//--- DIAGNOSTICS ONLY. These do not affect any trading decision.
+input bool   LogBiasDiagnostics       = true;  // print bias inputs on every evaluated bar
+
 //------------------------- Globals ---------------------------------
 datetime g_lastBar = 0;
 int      g_emaHandle = INVALID_HANDLE;
+
+//--- DIAGNOSTIC COUNTERS ONLY - never read by any trading decision.
+long g_bars          = 0;   // new M5 bars seen
+long g_blkEnable     = 0;   // blocked: EnableTrading=false
+long g_blkSession    = 0;   // blocked: outside session
+long g_blkSpread     = 0;   // blocked: spread
+long g_blkOpenPos    = 0;   // blocked: a position is already open
+long g_blkMaxTrades  = 0;   // blocked: MaxTradesPerDay
+long g_blkData       = 0;   // blocked: not enough M5 data
+long g_biasEvals     = 0;   // GetBias() calls
+long g_biasNoRates   = 0;   //   PATH 1: M15 CopyRates < 3
+long g_biasNoEMA     = 0;   //   PATH 2: EMA CopyBuffer < 3
+long g_biasFlat      = 0;   //   PATH 3: data fine, neither condition pair true
+long g_biasBull      = 0;   //   returned +1
+long g_biasBear      = 0;   //   returned -1
+long g_sweptLowCnt   = 0;   // bullish sweep detected (bias was non-zero)
+long g_sweptHighCnt  = 0;   // bearish sweep detected (bias was non-zero)
+long g_noAlignedSwp  = 0;   // bias present but no sweep in the bias direction
+long g_setupBull     = 0;   // bias>0 AND bullish sweep  ("BUY setup" printed)
+long g_setupBear     = 0;   // bias<0 AND bearish sweep  ("SELL setup" printed)
+long g_mssBull       = 0;   // of those, MSS true
+long g_mssBear       = 0;
+long g_confBull      = 0;   // of those, confirmations true
+long g_confBear      = 0;
+long g_entryBull     = 0;   // OpenBuy() called
+long g_entryBear     = 0;   // OpenSell() called
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -67,6 +96,13 @@ int OnInit()
             " (", NewYorkStartHour, "-", NewYorkEndHour, ")",
             "  [server time, current server hour=", ServerHour(), "]");
 
+   Print("Bias config: BiasTF=", EnumToString(BiasTF),
+         " EMA period=", BiasEMAPeriod,
+         " | M15 bars available=", Bars(_Symbol, BiasTF),
+         " | EMA handle=", g_emaHandle,
+         " | BarsCalculated=", BarsCalculated(g_emaHandle),
+         " (BarsCalculated may be 0 here and fill in on the first ticks)");
+
    return INIT_SUCCEEDED;
 }
 
@@ -75,6 +111,75 @@ void OnDeinit(const int reason)
 {
    if(g_emaHandle != INVALID_HANDLE)
       IndicatorRelease(g_emaHandle);
+
+   PrintDiagnosticSummary();
+}
+
+//+------------------------------------------------------------------+
+// DIAGNOSTICS ONLY. Printed once at the end of the run so the whole
+// funnel is visible in a single place: how many bars were evaluated,
+// where they were lost, and - critically - WHICH of the three "No bias."
+// paths actually fired.
+//+------------------------------------------------------------------+
+void PrintDiagnosticSummary()
+{
+   Print("=============== ICT V4 DIAGNOSTIC SUMMARY ===============");
+   Print("New M5 bars processed          : ", g_bars);
+   Print("  blocked EnableTrading=false  : ", g_blkEnable);
+   Print("  blocked outside session      : ", g_blkSession);
+   Print("  blocked spread               : ", g_blkSpread);
+   Print("  blocked position already open: ", g_blkOpenPos);
+   Print("  blocked MaxTradesPerDay      : ", g_blkMaxTrades);
+   Print("  blocked not enough M5 data   : ", g_blkData);
+   Print("---- bias ----------------------------------------------");
+   Print("GetBias() evaluations          : ", g_biasEvals);
+   Print("  PATH 1 M15 CopyRates < 3     : ", g_biasNoRates);
+   Print("  PATH 2 EMA CopyBuffer < 3    : ", g_biasNoEMA);
+   Print("  PATH 3 flat / mixed          : ", g_biasFlat);
+   Print("  bullish bias (+1)            : ", g_biasBull);
+   Print("  bearish bias (-1)            : ", g_biasBear);
+   Print("---- setup funnel (only runs when bias != 0) -----------");
+   Print("bullish sweeps seen            : ", g_sweptLowCnt);
+   Print("bearish sweeps seen            : ", g_sweptHighCnt);
+   Print("bias present but no aligned sweep: ", g_noAlignedSwp);
+   Print("BUY  setups (bias+sweep)       : ", g_setupBull,
+         "  MSS ok: ", g_mssBull, "  confirmations ok: ", g_confBull,
+         "  entries: ", g_entryBull);
+   Print("SELL setups (bias+sweep)       : ", g_setupBear,
+         "  MSS ok: ", g_mssBear, "  confirmations ok: ", g_confBear,
+         "  entries: ", g_entryBear);
+   Print("---- interpretation ------------------------------------");
+   if(g_bars == 0)
+      Print("  No bars processed at all - check the test range and symbol.");
+   else if(g_biasEvals == 0)
+      Print("  BLOCKER IS BEFORE GetBias(): every bar was stopped by one of the",
+            " blocked counters above.");
+   else if(g_biasNoRates == g_biasEvals)
+      Print("  BLOCKER = PATH 1: M15 rates were NEVER available. Bias data problem,",
+            " not a market problem.");
+   else if(g_biasNoEMA == g_biasEvals)
+      Print("  BLOCKER = PATH 2: the EMA buffer NEVER returned 3 values.",
+            " Indicator/handle/history problem, not a market problem.");
+   else if(g_biasBull + g_biasBear == 0)
+      Print("  BLOCKER = PATH 3: data was fine on every bar but the two bias",
+            " halves never agreed. This is a strategy-definition issue.");
+   else
+   {
+      Print("  Bias RESOLVED on ", g_biasBull + g_biasBear, " of ", g_biasEvals,
+            " evaluations - bias is NOT the blocker.");
+      if(g_setupBull + g_setupBear == 0)
+         Print("  BLOCKER = no liquidity sweep ever coincided with a matching bias.");
+      else if(g_mssBull + g_mssBear == 0)
+         Print("  BLOCKER = MSS never confirmed on the candle after the sweep",
+               " (check MinDisplacementPoints).");
+      else if(g_confBull + g_confBear == 0)
+         Print("  BLOCKER = FVG/OB/Breaker confirmation never satisfied.");
+      else if(g_entryBull + g_entryBear == 0)
+         Print("  BLOCKER = MSS and confirmations never true on the SAME bar.");
+      else
+         Print("  Entries were attempted - check the order-send log lines above.");
+   }
+   Print("========================================================");
 }
 
 //+------------------------------------------------------------------+
@@ -82,14 +187,18 @@ void OnTick()
 {
    if(!IsNewBar()) return;
 
+   g_bars++;
+
    if(!EnableTrading)
    {
+      g_blkEnable++;
       Print("Blocked: EnableTrading=false");
       return;
    }
 
    if(!IsTradingSession())
    {
+      g_blkSession++;
       Print("Blocked: outside trading session. Server hour=", ServerHour());
       return;
    }
@@ -97,15 +206,20 @@ void OnTick()
    int spread = GetSpreadPoints();
    if(spread > MaxSpreadPoints)
    {
+      g_blkSpread++;
       Print("Blocked: spread=", spread, " > max=", MaxSpreadPoints);
       return;
    }
 
    if(CountOpenPositions() > 0)
+   {
+      g_blkOpenPos++;
       return;
+   }
 
    if(TradesToday() >= MaxTradesPerDay)
    {
+      g_blkMaxTrades++;
       Print("Blocked: MaxTradesPerDay reached.");
       return;
    }
@@ -116,6 +230,7 @@ void OnTick()
    int need = MathMax(50, LiquidityLookback + SwingLookback + 10);
    if(CopyRates(_Symbol, EntryTF, 0, need, r) < need)
    {
+      g_blkData++;
       Print("Blocked: not enough price data.");
       return;
    }
@@ -131,6 +246,11 @@ void OnTick()
    // r[2] = sweep candle, r[1] = confirmation/MSS candle.
    bool sweptLow  = BullishLiquiditySweep(r);
    bool sweptHigh = BearishLiquiditySweep(r);
+
+   if(sweptLow)  g_sweptLowCnt++;
+   if(sweptHigh) g_sweptHighCnt++;
+   if(!((bias > 0 && sweptLow) || (bias < 0 && sweptHigh)))
+      g_noAlignedSwp++;
 
    if(bias > 0 && sweptLow)
    {
@@ -148,8 +268,15 @@ void OnTick()
           (!RequireOB || ob) &&
           (fvg || ob || brk));
 
+      g_setupBull++;
+      if(mss)           g_mssBull++;
+      if(confirmations) g_confBull++;
+
       if(mss && confirmations)
+      {
+         g_entryBull++;
          OpenBuy(r);
+      }
    }
 
    if(bias < 0 && sweptHigh)
@@ -168,8 +295,15 @@ void OnTick()
           (!RequireOB || ob) &&
           (fvg || ob || brk));
 
+      g_setupBear++;
+      if(mss)           g_mssBear++;
+      if(confirmations) g_confBear++;
+
       if(mss && confirmations)
+      {
+         g_entryBear++;
          OpenSell(r);
+      }
    }
 }
 
@@ -188,25 +322,83 @@ bool IsNewBar()
 }
 
 //+------------------------------------------------------------------+
+// DIAGNOSTIC BUILD: the return values below are byte-identical to the
+// original. Only counters and Print() calls were added, so that the three
+// different reasons GetBias() can return 0 can be told apart. "No bias."
+// in the journal covers ALL THREE of them:
+//   PATH 1  M15 CopyRates returned fewer than 3 bars      (no price data)
+//   PATH 2  EMA CopyBuffer returned fewer than 3 values   (indicator not ready)
+//   PATH 3  data was fine, but neither condition pair held (genuine flat/mixed)
 int GetBias()
 {
+   g_biasEvals++;
+
    MqlRates b[];
    ArraySetAsSeries(b, true);
 
-   if(CopyRates(_Symbol, BiasTF, 0, 3, b) < 3)
+   int gotRates = CopyRates(_Symbol, BiasTF, 0, 3, b);
+   if(gotRates < 3)
+   {
+      g_biasNoRates++;
+      if(LogBiasDiagnostics)
+         Print("BIAS PATH 1 (no M15 data): CopyRates(", EnumToString(BiasTF),
+               ") returned ", gotRates, " of 3, err=", GetLastError(),
+               ", Bars(", EnumToString(BiasTF), ")=", Bars(_Symbol, BiasTF));
       return 0;
+   }
 
    double ema[];
    ArraySetAsSeries(ema, true);
 
-   if(CopyBuffer(g_emaHandle, 0, 0, 3, ema) < 3)
+   int gotEma = CopyBuffer(g_emaHandle, 0, 0, 3, ema);
+   if(gotEma < 3)
+   {
+      g_biasNoEMA++;
+      if(LogBiasDiagnostics)
+         Print("BIAS PATH 2 (EMA not ready): CopyBuffer returned ", gotEma,
+               " of 3, err=", GetLastError(),
+               ", handle=", g_emaHandle,
+               ", BarsCalculated=", BarsCalculated(g_emaHandle),
+               ", Bars(", EnumToString(BiasTF), ")=", Bars(_Symbol, BiasTF),
+               ", EMA period=", BiasEMAPeriod);
       return 0;
+   }
 
-   if(b[1].close > ema[1] && b[1].close > b[2].close)
+   // Every input is available here - report the ACTUAL numbers compared.
+   bool bullAboveEma = (b[1].close > ema[1]);
+   bool bullRising   = (b[1].close > b[2].close);
+   bool bearBelowEma = (b[1].close < ema[1]);
+   bool bearFalling  = (b[1].close < b[2].close);
+
+   if(LogBiasDiagnostics)
+      Print("BIAS INPUTS bar=", TimeToString(b[1].time, TIME_DATE|TIME_MINUTES),
+            " close[1]=", DoubleToString(b[1].close, _Digits),
+            " close[2]=", DoubleToString(b[2].close, _Digits),
+            " EMA", BiasEMAPeriod, "[1]=", DoubleToString(ema[1], _Digits),
+            " | close-EMA=", DoubleToString((b[1].close-ema[1])/_Point, 0), "pts",
+            " close-prevClose=", DoubleToString((b[1].close-b[2].close)/_Point, 0), "pts",
+            " || bull(aboveEMA=", bullAboveEma, ",rising=", bullRising, ")",
+            " bear(belowEMA=", bearBelowEma, ",falling=", bearFalling, ")");
+
+   if(bullAboveEma && bullRising)
+   {
+      g_biasBull++;
       return 1;
+   }
 
-   if(b[1].close < ema[1] && b[1].close < b[2].close)
+   if(bearBelowEma && bearFalling)
+   {
+      g_biasBear++;
       return -1;
+   }
+
+   g_biasFlat++;
+   if(LogBiasDiagnostics)
+      Print("BIAS PATH 3 (flat/mixed): the two halves disagree - ",
+            (bullAboveEma ? "close is ABOVE the EMA" : "close is BELOW the EMA"),
+            " but the candle ",
+            (bullRising ? "closed UP" : (bearFalling ? "closed DOWN" : "closed FLAT")),
+            " vs the previous M15 close. Both halves must agree.");
 
    return 0;
 }
