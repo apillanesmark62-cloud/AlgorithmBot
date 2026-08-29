@@ -1,9 +1,9 @@
 # AlgorithmBot — MetaTrader 5 Expert Advisors
 
-Three independent MQL5 Expert Advisors. They share no strategy code: each is a
+Four independent MQL5 Expert Advisors. They share no strategy code: each is a
 self-contained `.mq5` file with its own logic, inputs and documentation.
 
-All three use **fixed fractional risk** on every trade — position size is a function
+All four use **fixed fractional risk** on every trade — position size is a function
 of account equity, the configured risk percentage and the stop distance, and nothing
 else. None contains martingale, grid, averaging down, post-loss size increases or
 revenge trades.
@@ -13,6 +13,7 @@ revenge trades.
 | [`Aggressive_Algorithm_bot`](Experts/Aggressive_Algorithm_bot.mq5) | any | H1 liquidity, M15 execution | M15 | [docs](docs/Aggressive_Algorithm_bot.md) |
 | [`XAUUSD_Scalper_V1`](Experts/XAUUSD_Scalper_V1.mq5) | XAUUSD | M15 bias, M5 setup, M1 entry | M1 | [docs](docs/XAUUSD_Scalper_V1.md) |
 | [`XAUUSD_VWAP_RSI_Scalper_V1`](Experts/XAUUSD_VWAP_RSI_Scalper_V1.mq5) | any (tuned for XAUUSD) | M5 | M5 | [docs](docs/XAUUSD_VWAP_RSI_Scalper_V1.md) |
+| [`XAUUSD_VWAP_VolumeProfile_V1`](Experts/XAUUSD_VWAP_VolumeProfile_V1.mq5) | any (tuned for XAUUSD) | M5 signal, M15 context | M5 | [docs](docs/XAUUSD_VWAP_VolumeProfile_V1.md) |
 
 ## Aggressive_Algorithm_bot
 
@@ -50,12 +51,29 @@ closed M5 candle — there is no tick-level entry path at all.
 
 The symbol is never hard-coded; only the defaults are gold-specific.
 
+## XAUUSD_VWAP_VolumeProfile_V1
+
+```
+daily volume profile (POC / VAH / VAL)  ->  level interaction  ->  rejection close  ->  entry
+```
+
+An **educational backtesting EA**. It builds a daily volume profile from M5 tick
+volume, derives POC, VAH and VAL, and trades a rejection of one of those levels in
+the direction of session VWAP, with M15 VWAP as higher-timeframe context.
+
+The profile is **progressive**: rebuilt from scratch on every closed M5 candle from
+the bars available at that moment, so it grows through the day and can never contain
+a candle that closes after the signal. That is the volume-profile look-ahead bug this
+EA is built to avoid, and the [documentation](docs/XAUUSD_VWAP_VolumeProfile_V1.md)
+states the binning, allocation and value-area rules precisely enough to check by hand.
+
 ## Definitions first
 
-`XAUUSD_Scalper_V1` and `XAUUSD_VWAP_RSI_Scalper_V1` both open their documentation
-with the exact mathematical definition of every term the strategy uses — swing
-high/low, bias, sweep, MSS/BOS, FVG, VWAP, RSI cross, position sizing, daily loss
-and new-candle detection — which is what the code implements literally.
+The three gold EAs open their documentation with the exact mathematical definition
+of every term the strategy uses — swing high/low, bias, sweep, MSS/BOS, FVG, VWAP,
+RSI cross, price bins, volume allocation, POC, value area, VAH/VAL, rejection,
+position sizing, daily loss and new-candle detection — which is what the code
+implements literally.
 
 ## Installation
 
@@ -69,7 +87,7 @@ and backtesting notes.
 - **Session hours are broker server time**, not local time and not UTC. Every EA
   prints the current server time to the Experts log at initialisation — compare that
   line against the real session clock and adjust the hour inputs accordingly.
-- **Check the point scaling.** Both gold EAs print the price distance each
+- **Check the point scaling.** The gold EAs print the price distance each
   point-based input resolves to; gold feeds vary between 2 and 3 digits, which
   changes what "one point" means by a factor of ten.
 - **Test on a demo account first**, over several distinct historical periods, and

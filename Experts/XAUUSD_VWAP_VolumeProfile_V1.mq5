@@ -1,0 +1,1123 @@
+//+------------------------------------------------------------------+
+//|                        XAUUSD_VWAP_VolumeProfile_V1.mq5          |
+//|                                                                  |
+//|  EDUCATIONAL BACKTESTING EA                                      |
+//|                                                                  |
+//|  M5 rejection of daily volume-profile levels (POC / VAH / VAL)   |
+//|  in the direction of session VWAP, with M15 VWAP as context.     |
+//|                                                                  |
+//|  NON-REPAINTING BY CONSTRUCTION:                                 |
+//|    - every decision input is read from CLOSED bars (index >= 1)  |
+//|    - the only shift-0 call reads the forming bar's OPEN TIME to  |
+//|      detect a bar rollover, never its prices or volume           |
+//|    - the volume profile is rebuilt each bar from the bars that   |
+//|      had already closed at that moment, so it grows through the  |
+//|      day and can never contain a future candle                   |
+//|    - signals are evaluated exactly once per closed M5 candle     |
+//|                                                                  |
+//|  Fixed fractional risk. No martingale, grid or averaging down.   |
+//|  No RSI, FVG, liquidity or order-block logic.                    |
+//|                                                                  |
+//|  Definitions: docs/XAUUSD_VWAP_VolumeProfile_V1.md               |
+//+------------------------------------------------------------------+
+#property copyright "XAUUSD_VWAP_VolumeProfile_V1"
+#property link      "https://github.com/apillanesmark62-cloud/AlgorithmBot"
+#property version   "1.00"
+#property description "Educational M5 EA: session VWAP + daily volume profile (POC/VAH/VAL) rejection."
+#property description "Non-repainting, closed-bar only. Fixed fractional risk."
+
+#include <Trade/Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| Inputs                                                           |
+//+------------------------------------------------------------------+
+input group "=== Volume profile ==="
+input int    ProfileDays          = 1;        // Days included in the profile (1 = today)
+input int    ProfileRows          = 100;      // Number of price bins
+input double ValueAreaPercent     = 70.0;     // Value area (% of total volume)
+input int    ProfileMaxBars       = 600;      // M5 bars scanned when building the profile
+input bool   ExcludeSignalBarFromProfile = true; // Build levels from bars BEFORE the signal candle
+
+input group "=== Signal ==="
+input double LevelTolerancePoints = 30;       // Level interaction tolerance (points)
+input bool   UseM15Filter         = true;     // Require M15 close to agree with M15 VWAP
+
+input group "=== Risk ==="
+input double RiskPercent          = 0.25;     // Risk per trade (% of equity)
+input double RiskReward           = 2.0;      // Reward : Risk ratio
+input double SLBufferPoints       = 50;       // SL buffer beyond the rejection candle (points)
+input double MaxLotSize           = 1.0;      // Maximum lot size
+
+input group "=== Daily protection ==="
+input int    MaxTradesPerDay      = 5;        // Max trades per day
+input double MaxDailyLossPercent  = 1.5;      // Max daily loss (%)
+input int    MaxOpenPositions     = 1;        // Max simultaneous positions
+input double MaxSpreadPoints      = 40;       // Max allowed spread (points)
+
+input group "=== Session (BROKER / SERVER TIME!) ==="
+input int    TradingSessionStart  = 7;        // Session start hour (server time)
+input int    TradingSessionEnd    = 21;       // Session end hour (server time)
+
+input group "=== Execution ==="
+input long   MagicNumber          = 20250819; // Magic number
+input int    MaxSlippagePoints    = 30;       // Max deviation (broker points)
+input string TradeComment         = "VWAP_VP_V1"; // Trade comment
+input bool   AutoAdjustForDigits  = true;     // Scale point inputs on 3/5 digit feeds
+
+input group "=== Diagnostics ==="
+input bool   LogEveryBar          = false;    // Log VWAP/POC/VAH/VAL every closed M5 bar
+
+//+------------------------------------------------------------------+
+//| Constants                                                        |
+//+------------------------------------------------------------------+
+#define SIGNAL_TF   PERIOD_M5
+#define CONTEXT_TF  PERIOD_M15
+
+//+------------------------------------------------------------------+
+//| Result of one volume-profile build (scalars only)                |
+//+------------------------------------------------------------------+
+struct ProfileResult
+  {
+   bool   valid;
+   double range_low;
+   double range_high;
+   double bin_size;
+   double total_volume;
+   int    bars_used;
+   int    poc_bin;
+   int    va_low_bin;
+   int    va_high_bin;
+   double poc;
+   double vah;
+   double val;
+  };
+
+//+------------------------------------------------------------------+
+//| Globals                                                          |
+//+------------------------------------------------------------------+
+CTrade   trade;
+
+double   g_bins[];                 // accumulated volume per price bin
+
+datetime g_last_bar     = 0;       // open time of the last processed M5 bar
+datetime g_day_start    = 0;       // server midnight of the current day
+
+double   g_point        = 0.0;
+int      g_digits       = 0;
+double   g_pt_scale     = 1.0;
+double   g_vol_min      = 0.0;
+double   g_vol_max      = 0.0;
+double   g_vol_step     = 0.0;
+int      g_vol_digits   = 2;
+int      g_stops_level  = 0;
+
+int      g_trades_today = 0;
+double   g_daily_pl_pct = 0.0;
+
+bool     g_init_ok      = false;
+
+//+------------------------------------------------------------------+
+//| Logging helpers                                                  |
+//+------------------------------------------------------------------+
+void Log(const string msg)
+  {
+   Print(msg);
+  }
+
+void Reject(const string reason)
+  {
+   Print("Trade rejected: "+reason);
+  }
+
+//+------------------------------------------------------------------+
+//| Input "points" -> real price distance                            |
+//+------------------------------------------------------------------+
+double Pts(const double points)
+  {
+   return(points*g_pt_scale*g_point);
+  }
+
+//+------------------------------------------------------------------+
+//| Current spread in broker points                                  |
+//+------------------------------------------------------------------+
+double SpreadPoints()
+  {
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   if(ask<=0.0 || bid<=0.0 || g_point<=0.0)
+      return(1e9);
+   return((ask-bid)/g_point);
+  }
+
+//+------------------------------------------------------------------+
+//| Server midnight of a given time                                  |
+//+------------------------------------------------------------------+
+datetime DayStartOf(const datetime t)
+  {
+   MqlDateTime d;
+   TimeToStruct(t,d);
+   d.hour = 0;
+   d.min  = 0;
+   d.sec  = 0;
+   return(StructToTime(d));
+  }
+
+//+------------------------------------------------------------------+
+//| Decimals implied by the broker volume step                       |
+//+------------------------------------------------------------------+
+int VolumeDigits(const double step)
+  {
+   if(step<=0.0)
+      return(2);
+   for(int d=0; d<=8; d++)
+     {
+      double scaled = step*MathPow(10.0,(double)d);
+      if(MathAbs(scaled-MathRound(scaled))<1e-8)
+         return(d);
+     }
+   return(2);
+  }
+
+//+------------------------------------------------------------------+
+//| Cache symbol properties                                          |
+//+------------------------------------------------------------------+
+bool RefreshSymbolInfo()
+  {
+   g_point       = SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   g_digits      = (int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   g_vol_min     = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   g_vol_max     = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   g_vol_step    = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   g_stops_level = (int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   g_vol_digits  = VolumeDigits(g_vol_step);
+
+   g_pt_scale = 1.0;
+   if(AutoAdjustForDigits && (g_digits==3 || g_digits==5))
+      g_pt_scale = 10.0;
+
+   if(g_point<=0.0 || g_vol_step<=0.0)
+     {
+      Log("Init error: invalid symbol properties (point / volume step).");
+      return(false);
+     }
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   if(!RefreshSymbolInfo())
+      return(INIT_FAILED);
+
+   if(ProfileDays<1)
+     {
+      Log("Init error: ProfileDays must be >= 1.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(ProfileRows<10 || ProfileRows>5000)
+     {
+      Log("Init error: ProfileRows must be between 10 and 5000.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(ValueAreaPercent<=0.0 || ValueAreaPercent>100.0)
+     {
+      Log("Init error: ValueAreaPercent must be between 0 and 100.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(ProfileMaxBars<100)
+     {
+      Log("Init error: ProfileMaxBars must be >= 100.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(RiskPercent<=0.0 || RiskReward<=0.0 || MaxLotSize<=0.0)
+     {
+      Log("Init error: RiskPercent, RiskReward and MaxLotSize must be > 0.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(MaxOpenPositions<1)
+     {
+      Log("Init error: MaxOpenPositions must be >= 1.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(TradingSessionStart<0 || TradingSessionStart>23
+      || TradingSessionEnd<0 || TradingSessionEnd>23)
+     {
+      Log("Init error: session hours must be between 0 and 23.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   if(ArrayResize(g_bins,ProfileRows)!=ProfileRows)
+     {
+      Log("Init error: could not allocate the volume-profile bins.");
+      return(INIT_FAILED);
+     }
+
+   trade.SetExpertMagicNumber((ulong)MagicNumber);
+   trade.SetDeviationInPoints((ulong)(MaxSlippagePoints<1 ? 1 : MaxSlippagePoints));
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+   trade.LogLevel(LOG_LEVEL_ERRORS);
+
+   g_last_bar = 0;
+   UpdateDailyStats();
+
+   g_init_ok = true;
+
+   Log("=================================================================");
+   Log("XAUUSD_VWAP_VolumeProfile_V1 initialised on "+_Symbol+" (signals on M5)");
+   Log(StringFormat("Point scaling: digits=%d point=%s scale=%.0f  => 1 input point = %s price",
+                    g_digits,DoubleToString(g_point,g_digits),g_pt_scale,
+                    DoubleToString(Pts(1.0),g_digits)));
+   Log("  LevelTolerancePoints "+DoubleToString(LevelTolerancePoints,0)+" pts = "
+       +DoubleToString(Pts(LevelTolerancePoints),g_digits));
+   Log("  SLBufferPoints       "+DoubleToString(SLBufferPoints,0)+" pts = "
+       +DoubleToString(Pts(SLBufferPoints),g_digits));
+   Log("  MaxSpreadPoints      "+DoubleToString(MaxSpreadPoints,0)+" pts = "
+       +DoubleToString(Pts(MaxSpreadPoints),g_digits));
+   Log(StringFormat("Profile: %d day(s), %d rows, value area %.1f%%, signal bar %s",
+                    ProfileDays,ProfileRows,ValueAreaPercent,
+                    ExcludeSignalBarFromProfile ? "EXCLUDED" : "included"));
+   Log(StringFormat("M15 context filter: %s",UseM15Filter ? "ON" : "OFF"));
+   Log(StringFormat("Volume: min=%s max=%s step=%s",
+                    DoubleToString(g_vol_min,g_vol_digits),
+                    DoubleToString(g_vol_max,g_vol_digits),
+                    DoubleToString(g_vol_step,g_vol_digits)));
+   Log(StringFormat("Risk %.2f%% | R:R %.2f | max %d trades/day | max daily loss %.2f%%",
+                    RiskPercent,RiskReward,MaxTradesPerDay,MaxDailyLossPercent));
+   Log(StringFormat("Current server time: %s  (session filter %d:00-%d:00 server)",
+                    TimeToString(TimeCurrent(),TIME_DATE|TIME_MINUTES),
+                    TradingSessionStart,TradingSessionEnd));
+   Log("Session hours, the VWAP reset and the profile day all use BROKER/SERVER time.");
+   Log("=================================================================");
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| OnDeinit                                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   ArrayFree(g_bins);
+  }
+
+//+------------------------------------------------------------------+
+//| Definition 13: new M5 candle detection                           |
+//|                                                                  |
+//| The forming bar's OPEN TIME changes exactly when the previous    |
+//| bar closes. No price or volume of bar 0 is ever read.            |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+  {
+   datetime t = iTime(_Symbol,SIGNAL_TF,0);
+   if(t==0 || t==g_last_bar)
+      return(false);
+   g_last_bar = t;
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Definitions 1 + 2: session VWAP over the closed bars of the      |
+//| current server day on the requested timeframe.                   |
+//|                                                                  |
+//|   TypicalPrice = (H + L + C) / 3                                 |
+//|   VWAP = SUM(TypicalPrice * TickVolume) / SUM(TickVolume)        |
+//|                                                                  |
+//| The scan stops at the first bar of a different server date, so   |
+//| the daily reset is automatic and needs no stored state.          |
+//+------------------------------------------------------------------+
+bool ComputeSessionVWAP(const ENUM_TIMEFRAMES tf,const int max_bars,
+                        double &vwap,int &bars_used,double &last_close)
+  {
+   vwap       = 0.0;
+   bars_used  = 0;
+   last_close = 0.0;
+
+   MqlRates r[];
+   ArraySetAsSeries(r,true);
+   int copied = CopyRates(_Symbol,tf,0,max_bars,r);
+   if(copied<2)
+      return(false);
+
+   datetime ref_day = DayStartOf(r[1].time);
+
+   double sum_pv  = 0.0;
+   double sum_vol = 0.0;
+   int    n       = 0;
+
+   for(int i=1; i<copied; i++)
+     {
+      if(DayStartOf(r[i].time)!=ref_day)
+         break;                                    // start of the session reached
+
+      double tp  = (r[i].high+r[i].low+r[i].close)/3.0;
+      double vol = (double)r[i].tick_volume;
+      if(vol<=0.0)
+         vol = 1.0;                                // a dead bar must not zero the sum
+
+      sum_pv  += tp*vol;
+      sum_vol += vol;
+      n++;
+     }
+
+   if(n<=0 || sum_vol<=0.0)
+      return(false);
+
+   vwap       = sum_pv/sum_vol;
+   bars_used  = n;
+   last_close = r[1].close;
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Definition 3: bin index of a price, clamped into the profile     |
+//+------------------------------------------------------------------+
+int BinIndex(const double price,const double range_low,const double bin_size)
+  {
+   if(bin_size<=0.0)
+      return(0);
+   int b = (int)MathFloor((price-range_low)/bin_size);
+   if(b<0)
+      b = 0;
+   if(b>ProfileRows-1)
+      b = ProfileRows-1;
+   return(b);
+  }
+
+double BinLowPrice(const double range_low,const double bin_size,const int b)
+  {
+   return(range_low+bin_size*(double)b);
+  }
+
+double BinHighPrice(const double range_low,const double bin_size,const int b)
+  {
+   return(range_low+bin_size*(double)(b+1));
+  }
+
+double BinMidPrice(const double range_low,const double bin_size,const int b)
+  {
+   return(range_low+bin_size*((double)b+0.5));
+  }
+
+//+------------------------------------------------------------------+
+//| Definitions 3-8: build the daily volume profile and derive       |
+//| POC, VAH and VAL.                                                |
+//|                                                                  |
+//| LOOK-AHEAD SAFETY: the scan starts at bar 1 (or bar 2 when       |
+//| ExcludeSignalBarFromProfile is on) and walks BACKWARDS only, so  |
+//| the profile can only ever contain candles that had already       |
+//| closed when the signal is evaluated. It is rebuilt from scratch  |
+//| on every new bar, so it grows through the trading day and is     |
+//| never today's finished profile applied retroactively.            |
+//+------------------------------------------------------------------+
+bool BuildProfile(ProfileResult &vp)
+  {
+   vp.valid        = false;
+   vp.range_low    = 0.0;
+   vp.range_high   = 0.0;
+   vp.bin_size     = 0.0;
+   vp.total_volume = 0.0;
+   vp.bars_used    = 0;
+   vp.poc_bin      = 0;
+   vp.va_low_bin   = 0;
+   vp.va_high_bin  = 0;
+   vp.poc          = 0.0;
+   vp.vah          = 0.0;
+   vp.val          = 0.0;
+
+   MqlRates r[];
+   ArraySetAsSeries(r,true);
+   int copied = CopyRates(_Symbol,SIGNAL_TF,0,ProfileMaxBars,r);
+   if(copied<3)
+      return(false);
+
+   int first = (ExcludeSignalBarFromProfile ? 2 : 1);
+   if(copied<=first)
+      return(false);
+
+   // the profile window is anchored on the SIGNAL bar's server day
+   datetime ref_day   = DayStartOf(r[1].time);
+   datetime last_day  = ref_day;
+   int      days_seen = 1;
+
+   // ---- pass 1: the price range of the window --------------------------
+   double range_low  = 0.0;
+   double range_high = 0.0;
+   int    n          = 0;
+   int    last_index = first-1;
+
+   for(int i=first; i<copied; i++)
+     {
+      datetime bd = DayStartOf(r[i].time);
+      if(bd>ref_day)
+         continue;                                  // defensive, should not happen
+      if(bd!=last_day)
+        {
+         days_seen++;
+         if(days_seen>ProfileDays)
+            break;
+         last_day = bd;
+        }
+
+      if(n==0)
+        {
+         range_low  = r[i].low;
+         range_high = r[i].high;
+        }
+      else
+        {
+         if(r[i].low<range_low)   range_low  = r[i].low;
+         if(r[i].high>range_high) range_high = r[i].high;
+        }
+      n++;
+      last_index = i;
+     }
+
+   if(n<2)
+      return(false);                                // not enough data yet today
+
+   double bin_size = (range_high-range_low)/(double)ProfileRows;
+   if(bin_size<=0.0)
+      return(false);                                // flat window, no profile
+
+   // ---- pass 2: definition 4, allocate tick volume to bins -------------
+   ArrayInitialize(g_bins,0.0);
+   double total = 0.0;
+
+   for(int i=first; i<=last_index; i++)
+     {
+      datetime bd = DayStartOf(r[i].time);
+      if(bd>ref_day)
+         continue;
+
+      double vol = (double)r[i].tick_volume;
+      if(vol<=0.0)
+         vol = 1.0;
+
+      int b_low  = BinIndex(r[i].low,range_low,bin_size);
+      int b_high = BinIndex(r[i].high,range_low,bin_size);
+      if(b_high<b_low)
+        {
+         int swap = b_low;
+         b_low  = b_high;
+         b_high = swap;
+        }
+
+      int    spanned = b_high-b_low+1;
+      double share   = vol/(double)spanned;
+
+      for(int b=b_low; b<=b_high; b++)
+         g_bins[b] += share;
+
+      total += vol;
+     }
+
+   if(total<=0.0)
+      return(false);
+
+   // ---- definition 5: POC (lowest bin index wins a tie) ----------------
+   int    poc_bin = 0;
+   double poc_vol = g_bins[0];
+   for(int b=1; b<ProfileRows; b++)
+     {
+      if(g_bins[b]>poc_vol)
+        {
+         poc_vol = g_bins[b];
+         poc_bin = b;
+        }
+     }
+
+   // ---- definition 6: value area, single-bin expansion from the POC ----
+   double target = total*ValueAreaPercent/100.0;
+   double acc    = g_bins[poc_bin];
+   int    up     = poc_bin+1;
+   int    down   = poc_bin-1;
+   int    va_hi  = poc_bin;
+   int    va_lo  = poc_bin;
+
+   while(acc<target && (up<ProfileRows || down>=0))
+     {
+      double v_up   = (up<ProfileRows ? g_bins[up]   : -1.0);
+      double v_down = (down>=0        ? g_bins[down] : -1.0);
+
+      if(v_up>=v_down && up<ProfileRows)            // a tie resolves upward
+        {
+         acc  += g_bins[up];
+         va_hi = up;
+         up++;
+        }
+      else
+         if(down>=0)
+           {
+            acc  += g_bins[down];
+            va_lo = down;
+            down--;
+           }
+         else
+            break;
+     }
+
+   vp.valid        = true;
+   vp.range_low    = range_low;
+   vp.range_high   = range_high;
+   vp.bin_size     = bin_size;
+   vp.total_volume = total;
+   vp.bars_used    = n;
+   vp.poc_bin      = poc_bin;
+   vp.va_low_bin   = va_lo;
+   vp.va_high_bin  = va_hi;
+   vp.poc          = BinMidPrice(range_low,bin_size,poc_bin);   // definition 5
+   vp.vah          = BinHighPrice(range_low,bin_size,va_hi);    // definition 7
+   vp.val          = BinLowPrice(range_low,bin_size,va_lo);     // definition 8
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Session filter (server time, wrap-around supported)              |
+//+------------------------------------------------------------------+
+bool InTradingSession()
+  {
+   if(TradingSessionStart==TradingSessionEnd)
+      return(true);                                 // 24 hours
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(),dt);
+
+   if(TradingSessionStart<TradingSessionEnd)
+      return(dt.hour>=TradingSessionStart && dt.hour<TradingSessionEnd);
+   return(dt.hour>=TradingSessionStart || dt.hour<TradingSessionEnd);
+  }
+
+//+------------------------------------------------------------------+
+//| Count this EA's open positions                                   |
+//+------------------------------------------------------------------+
+int CountOpenPositions()
+  {
+   int count = 0;
+   int total = PositionsTotal();
+   for(int i=0; i<total; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket==0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber)
+         continue;
+      count++;
+     }
+   return(count);
+  }
+
+//+------------------------------------------------------------------+
+//| Definition 12: daily trade count and daily P/L, rebuilt from     |
+//| deal history so both are correct after a restart.                |
+//+------------------------------------------------------------------+
+void UpdateDailyStats()
+  {
+   datetime now       = TimeCurrent();
+   datetime day_start = DayStartOf(now);
+
+   if(day_start!=g_day_start)
+     {
+      g_day_start = day_start;
+      Log("New trading day: "+TimeToString(day_start,TIME_DATE)
+          +" - daily counters reset.");
+     }
+
+   int    trades   = 0;
+   double realized = 0.0;
+
+   if(HistorySelect(day_start,now+1))
+     {
+      int total = HistoryDealsTotal();
+      for(int i=0; i<total; i++)
+        {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(ticket==0)
+            continue;
+         if(HistoryDealGetString(ticket,DEAL_SYMBOL)!=_Symbol)
+            continue;
+         if(HistoryDealGetInteger(ticket,DEAL_MAGIC)!=MagicNumber)
+            continue;
+
+         long type = HistoryDealGetInteger(ticket,DEAL_TYPE);
+         if(type!=DEAL_TYPE_BUY && type!=DEAL_TYPE_SELL)
+            continue;
+
+         if(HistoryDealGetInteger(ticket,DEAL_ENTRY)==DEAL_ENTRY_IN)
+            trades++;
+
+         realized += HistoryDealGetDouble(ticket,DEAL_PROFIT)
+                     + HistoryDealGetDouble(ticket,DEAL_SWAP)
+                     + HistoryDealGetDouble(ticket,DEAL_COMMISSION);
+        }
+     }
+
+   double floating = 0.0;
+   int positions = PositionsTotal();
+   for(int i=0; i<positions; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket==0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber)
+         continue;
+      floating += PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+     }
+
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double start_bal = balance-realized;
+   if(start_bal<=0.0)
+      start_bal = (balance>1.0 ? balance : 1.0);
+
+   g_trades_today = trades;
+   g_daily_pl_pct = (realized+floating)/start_bal*100.0;
+  }
+
+//+------------------------------------------------------------------+
+//| All non-signal gates. Returns "" when a trade may be opened.     |
+//+------------------------------------------------------------------+
+string TradingHaltReason()
+  {
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return("terminal trading is disabled");
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return("EA trading is disabled");
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return("account trading is disabled");
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+      return("expert trading is disabled on this account");
+
+   long mode = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE);
+   if(mode==SYMBOL_TRADE_MODE_DISABLED || mode==SYMBOL_TRADE_MODE_CLOSEONLY)
+      return("symbol trading is disabled");
+
+   if(CountOpenPositions()>=MaxOpenPositions)
+      return("a position with this magic number is already open");
+   if(MaxTradesPerDay>0 && g_trades_today>=MaxTradesPerDay)
+      return(StringFormat("daily trade limit reached (%d of %d)",
+                          g_trades_today,MaxTradesPerDay));
+   if(MaxDailyLossPercent>0.0 && g_daily_pl_pct<=-MathAbs(MaxDailyLossPercent))
+      return(StringFormat("daily loss limit reached (%.2f%%, limit %.2f%%)",
+                          g_daily_pl_pct,-MathAbs(MaxDailyLossPercent)));
+   if(!InTradingSession())
+      return("outside the trading session");
+
+   double sp = SpreadPoints();
+   if(sp>MaxSpreadPoints*g_pt_scale)
+      return(StringFormat("spread too high (%.0f > %.0f broker points)",
+                          sp,MaxSpreadPoints*g_pt_scale));
+
+   return("");
+  }
+
+//+------------------------------------------------------------------+
+//| Minimum stop distance the broker will accept                     |
+//+------------------------------------------------------------------+
+double MinStopDistance()
+  {
+   double stops  = (double)g_stops_level*g_point;
+   double freeze = (double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL)*g_point;
+   double spread = SymbolInfoDouble(_Symbol,SYMBOL_ASK)-SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double d = (stops>freeze ? stops : freeze);
+   double m = spread+g_point;
+   return(d>m ? d : m);
+  }
+
+//+------------------------------------------------------------------+
+//| Normalize a volume to the broker's step and limits               |
+//+------------------------------------------------------------------+
+double NormalizeLots(double lots)
+  {
+   if(g_vol_step<=0.0)
+      return(0.0);
+   lots = MathFloor(lots/g_vol_step+1e-8)*g_vol_step;
+   if(lots>g_vol_max)
+      lots = g_vol_max;
+   if(lots>MaxLotSize)
+      lots = MathFloor(MaxLotSize/g_vol_step+1e-8)*g_vol_step;
+   return(NormalizeDouble(lots,g_vol_digits));
+  }
+
+//+------------------------------------------------------------------+
+//| Definition 14: dynamic position sizing.                          |
+//| Reads equity, RiskPercent and the real stop distance only -      |
+//| never previous results.                                          |
+//+------------------------------------------------------------------+
+double CalculateLotSize(const double entry,const double sl)
+  {
+   double sl_distance = MathAbs(entry-sl);
+   if(sl_distance<=0.0)
+     {
+      Reject("stop distance is zero");
+      return(0.0);
+     }
+
+   double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tick_value<=0.0)
+      tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   if(tick_size<=0.0 || tick_value<=0.0)
+     {
+      Reject("broker tick size / tick value unavailable");
+      return(0.0);
+     }
+
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double risk_money = equity*RiskPercent/100.0;
+   if(risk_money<=0.0)
+     {
+      Reject("computed risk amount is zero");
+      return(0.0);
+     }
+
+   double loss_per_lot = (sl_distance/tick_size)*tick_value;
+   if(loss_per_lot<=0.0)
+     {
+      Reject("computed loss per lot is zero");
+      return(0.0);
+     }
+
+   double lots = NormalizeLots(risk_money/loss_per_lot);
+
+   if(lots<g_vol_min)
+     {
+      Reject(StringFormat("risk-correct volume %s is below the broker minimum %s "
+                          "(stop %.0f points at %.2f%% risk) - not rounding up",
+                          DoubleToString(lots,g_vol_digits),
+                          DoubleToString(g_vol_min,g_vol_digits),
+                          sl_distance/g_point,RiskPercent));
+      return(0.0);
+     }
+   if(lots>g_vol_max)
+     {
+      Reject("computed volume exceeds the broker maximum");
+      return(0.0);
+     }
+   return(lots);
+  }
+
+//+------------------------------------------------------------------+
+//| Margin validation                                                |
+//+------------------------------------------------------------------+
+bool MarginIsSufficient(const ENUM_ORDER_TYPE type,const double lots,const double price)
+  {
+   double margin = 0.0;
+   if(!OrderCalcMargin(type,_Symbol,lots,price,margin))
+     {
+      Reject("OrderCalcMargin failed, error "+IntegerToString(GetLastError()));
+      return(false);
+     }
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(margin>free_margin)
+     {
+      Reject(StringFormat("insufficient margin (need %.2f, free %.2f)",margin,free_margin));
+      return(false);
+     }
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Build, validate and send the order                               |
+//|                                                                  |
+//| candle_low / candle_high are the rejection candle's extremes;    |
+//| the stop sits beyond them by SLBufferPoints.                     |
+//+------------------------------------------------------------------+
+bool OpenPosition(const bool is_long,const double candle_low,const double candle_high,
+                  const double level,const string level_name)
+  {
+   string halt = TradingHaltReason();
+   if(halt!="")
+     {
+      Reject(halt);
+      return(false);
+     }
+
+   long mode = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE);
+   if(is_long && mode==SYMBOL_TRADE_MODE_SHORTONLY)
+     {
+      Reject("symbol is short-only");
+      return(false);
+     }
+   if(!is_long && mode==SYMBOL_TRADE_MODE_LONGONLY)
+     {
+      Reject("symbol is long-only");
+      return(false);
+     }
+
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   if(ask<=0.0 || bid<=0.0)
+     {
+      Reject("no valid market prices");
+      return(false);
+     }
+
+   double entry  = NormalizeDouble(is_long ? ask : bid,g_digits);
+   double buffer = Pts(SLBufferPoints);
+   double sl     = NormalizeDouble(is_long ? candle_low-buffer
+                                           : candle_high+buffer,g_digits);
+
+   if((is_long && sl>=entry) || (!is_long && sl<=entry))
+     {
+      Reject(StringFormat("stop %s is on the wrong side of the entry %s "
+                          "(price moved through the rejection candle)",
+                          DoubleToString(sl,g_digits),
+                          DoubleToString(entry,g_digits)));
+      return(false);
+     }
+
+   double risk     = MathAbs(entry-sl);
+   double min_dist = MinStopDistance();
+   if(risk<min_dist)
+     {
+      Reject(StringFormat("stop distance %s is below the broker minimum %s",
+                          DoubleToString(risk,g_digits),
+                          DoubleToString(min_dist,g_digits)));
+      return(false);
+     }
+
+   double tp = NormalizeDouble(is_long ? entry+risk*RiskReward
+                                       : entry-risk*RiskReward,g_digits);
+   if((is_long && (tp<=entry || (tp-entry)<min_dist))
+      || (!is_long && (tp>=entry || (entry-tp)<min_dist)))
+     {
+      Reject("take profit distance is invalid");
+      return(false);
+     }
+
+   double lots = CalculateLotSize(entry,sl);
+   if(lots<=0.0)
+      return(false);                                // already logged the reason
+
+   if(!MarginIsSufficient(is_long ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,lots,entry))
+      return(false);
+
+   bool sent = (is_long ? trade.Buy(lots,_Symbol,0.0,sl,tp,TradeComment)
+                        : trade.Sell(lots,_Symbol,0.0,sl,tp,TradeComment));
+   uint code = trade.ResultRetcode();
+
+   if(!sent || (code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_DONE_PARTIAL
+                && code!=TRADE_RETCODE_PLACED))
+     {
+      Log(StringFormat("%s order FAILED. Retcode=%d (%s) LastError=%d",
+                       is_long ? "BUY" : "SELL",
+                       (int)code,trade.ResultRetcodeDescription(),GetLastError()));
+      return(false);
+     }
+
+   double fill = trade.ResultPrice();
+   if(fill<=0.0)
+      fill = entry;
+
+   Log("-----------------------------------------------------------------");
+   Log(StringFormat("Trade opened: %s %s at %s",
+                    is_long ? "BUY" : "SELL",_Symbol,DoubleToString(fill,g_digits)));
+   Log("  Volume      : "+DoubleToString(lots,g_vol_digits));
+   Log("  VP level    : "+level_name+" = "+DoubleToString(level,g_digits));
+   Log("  Stop loss   : "+DoubleToString(sl,g_digits)
+       +"  (rejection candle "+(is_long ? "low " : "high ")
+       +DoubleToString(is_long ? candle_low : candle_high,g_digits)
+       +" +/- "+DoubleToString(SLBufferPoints,0)+" pts)");
+   Log("  Take profit : "+DoubleToString(tp,g_digits)
+       +"  (R:R "+DoubleToString(RiskReward,2)+")");
+   Log(StringFormat("  Risk        : %.2f%% of equity | risk distance %.0f points",
+                    RiskPercent,risk/g_point));
+   Log(StringFormat("  Trade %d of %d today | daily P/L %.2f%%",
+                    g_trades_today+1,MaxTradesPerDay,g_daily_pl_pct));
+   Log("-----------------------------------------------------------------");
+
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Definition 9: does level L interact with the closed candle?      |
+//| The level must lie inside the candle's range widened by the      |
+//| tolerance on both sides.                                         |
+//+------------------------------------------------------------------+
+bool LevelInteracts(const double level,const double c_low,const double c_high,
+                    const double tol)
+  {
+   return(level>=c_low-tol && level<=c_high+tol);
+  }
+
+//+------------------------------------------------------------------+
+//| Evaluated exactly once per newly closed M5 candle                |
+//+------------------------------------------------------------------+
+void ProcessNewBar()
+  {
+   UpdateDailyStats();
+
+   // ---- the closed signal candle ---------------------------------------
+   MqlRates r[];
+   ArraySetAsSeries(r,true);
+   if(CopyRates(_Symbol,SIGNAL_TF,0,3,r)<3)
+      return;
+
+   double c_open  = r[1].open;
+   double c_high  = r[1].high;
+   double c_low   = r[1].low;
+   double c_close = r[1].close;
+   datetime c_time = r[1].time;
+
+   // ---- session VWAP ----------------------------------------------------
+   double vwap = 0.0, vwap_close = 0.0;
+   int    vwap_bars = 0;
+   if(!ComputeSessionVWAP(SIGNAL_TF,ProfileMaxBars,vwap,vwap_bars,vwap_close))
+     {
+      if(LogEveryBar)
+         Log("Session VWAP not available yet (no closed bars in this day).");
+      return;
+     }
+
+   // ---- volume profile --------------------------------------------------
+   ProfileResult vp;
+   if(!BuildProfile(vp) || !vp.valid)
+     {
+      if(LogEveryBar)
+         Log("Volume profile not available yet (too few closed bars in the window).");
+      return;
+     }
+
+   // ---- definition 3: bias ---------------------------------------------
+   string bias = "NONE";
+   if(c_close>vwap) bias = "BULLISH";
+   if(c_close<vwap) bias = "BEARISH";
+
+   if(LogEveryBar)
+     {
+      Log(StringFormat("Bar %s | Current price = %s | Bias = %s",
+                       TimeToString(c_time,TIME_DATE|TIME_MINUTES),
+                       DoubleToString(c_close,g_digits),bias));
+      Log(StringFormat("  VWAP = %s (%d bars) | POC = %s | VAH = %s | VAL = %s "
+                       "| profile bars = %d",
+                       DoubleToString(vwap,g_digits),vwap_bars,
+                       DoubleToString(vp.poc,g_digits),
+                       DoubleToString(vp.vah,g_digits),
+                       DoubleToString(vp.val,g_digits),
+                       vp.bars_used));
+     }
+
+   // price exactly at VWAP is not traded, in either direction
+   if(bias=="NONE")
+      return;
+
+   bool want_long = (bias=="BULLISH");
+
+   // ---- M15 higher-timeframe context -----------------------------------
+   if(UseM15Filter)
+     {
+      double m15_vwap = 0.0, m15_close = 0.0;
+      int    m15_bars = 0;
+      if(!ComputeSessionVWAP(CONTEXT_TF,300,m15_vwap,m15_bars,m15_close))
+         return;
+
+      bool m15_bull = (m15_close>m15_vwap);
+      bool m15_bear = (m15_close<m15_vwap);
+      if((want_long && !m15_bull) || (!want_long && !m15_bear))
+        {
+         if(LogEveryBar)
+            Log(StringFormat("  M15 context disagrees (M15 close %s vs M15 VWAP %s) "
+                             "- no trade",
+                             DoubleToString(m15_close,g_digits),
+                             DoubleToString(m15_vwap,g_digits)));
+         return;
+        }
+     }
+
+   // ---- definition 9: pick the interacting level closest to the close ---
+   double tol = Pts(LevelTolerancePoints);
+
+   double levels[3];
+   string names[3];
+   levels[0] = vp.poc;  names[0] = "POC";
+   levels[1] = vp.vah;  names[1] = "VAH";
+   levels[2] = vp.val;  names[2] = "VAL";
+
+   int    best = -1;
+   double best_dist = 0.0;
+   for(int k=0; k<3; k++)
+     {
+      if(!LevelInteracts(levels[k],c_low,c_high,tol))
+         continue;
+      double dist = MathAbs(c_close-levels[k]);
+      if(best<0 || dist<best_dist)
+        {
+         best = k;
+         best_dist = dist;
+        }
+     }
+
+   if(best<0)
+      return;                                       // no level in play, no trade
+
+   double level = levels[best];
+   string lname = names[best];
+
+   // ---- definitions 10/11: objective rejection --------------------------
+   bool rejection = false;
+   if(want_long)
+      rejection = (c_low<=level+tol)      // traded down to or through the level
+                  && (c_close>level)      // closed back above it
+                  && (c_close>c_open)     // closed bullish
+                  && (c_close>vwap);      // on the bullish side of VWAP
+   else
+      rejection = (c_high>=level-tol)
+                  && (c_close<level)
+                  && (c_close<c_open)
+                  && (c_close<vwap);
+
+   if(!rejection)
+     {
+      if(LogEveryBar)
+         Log("  VP level interacted with = "+lname
+             +" | Rejection = NO (touch only, no valid rejection close)");
+      return;
+     }
+
+   // ---- signal ----------------------------------------------------------
+   Log("-----------------------------------------------------------------");
+   Log(StringFormat("%s signal detected on the M5 candle closed at %s",
+                    want_long ? "BUY" : "SELL",
+                    TimeToString(c_time,TIME_DATE|TIME_MINUTES)));
+   Log("  VWAP = "+DoubleToString(vwap,g_digits)
+       +"  (session VWAP over "+IntegerToString(vwap_bars)+" closed M5 bars)");
+   Log("  POC  = "+DoubleToString(vp.poc,g_digits)
+       +"  | VAH = "+DoubleToString(vp.vah,g_digits)
+       +"  | VAL = "+DoubleToString(vp.val,g_digits));
+   Log(StringFormat("  Profile: %d bars, %d rows, range %s - %s, value area %.1f%%",
+                    vp.bars_used,ProfileRows,
+                    DoubleToString(vp.range_low,g_digits),
+                    DoubleToString(vp.range_high,g_digits),
+                    ValueAreaPercent));
+   Log("  Current price = "+DoubleToString(c_close,g_digits)+"  | Bias = "+bias);
+   Log("  VP level interacted with = "+lname+" ("+DoubleToString(level,g_digits)+")");
+   Log(StringFormat("  Rejection = YES (candle O %s H %s L %s C %s)",
+                    DoubleToString(c_open,g_digits),
+                    DoubleToString(c_high,g_digits),
+                    DoubleToString(c_low,g_digits),
+                    DoubleToString(c_close,g_digits)));
+   Log(StringFormat("  Spread = %.0f broker points | trades today %d/%d | daily P/L %.2f%%",
+                    SpreadPoints(),g_trades_today,MaxTradesPerDay,g_daily_pl_pct));
+
+   OpenPosition(want_long,c_low,c_high,level,lname);
+  }
+
+//+------------------------------------------------------------------+
+//| OnTick - everything is gated behind the new-bar check            |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   if(!g_init_ok)
+      return;
+   if(!IsNewBar())
+      return;
+
+   ProcessNewBar();
+  }
+//+------------------------------------------------------------------+
