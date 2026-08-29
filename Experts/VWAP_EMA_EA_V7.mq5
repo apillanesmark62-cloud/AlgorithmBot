@@ -31,7 +31,7 @@
 //|                                                                  |
 //| Retains every correctness fix from build 6.01.                   |
 //+------------------------------------------------------------------+
-#property version   "7.01"
+#property version   "7.02"
 #property description "Multi-setup M5 EA with per-setup attribution. Research build."
 
 #include <Trade/Trade.mqh>
@@ -968,7 +968,11 @@ void OnTick()
       dir = SetupEMAPullback(r[1],fast1,fast2,slow1,atr1);
       if(dir!=0) setupId=SETUP_PULL;
    }
-   if(dir==0 && vwapOK)
+   // FIX 7.02: Setup C does not read the VWAP at all, so gating it behind
+   // vwapOK was wrong. On timeframes with few bars per day (H4 has six) the
+   // daily VWAP can never reach MinVWAPBars, which silently disabled the
+   // breakout setup as well and produced zero trades.
+   if(dir==0)
    {
       dir = SetupORB(r[1],fast1,fast2,slow1,atr1);
       if(dir!=0) setupId=SETUP_ORB;
