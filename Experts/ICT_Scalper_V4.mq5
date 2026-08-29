@@ -333,6 +333,9 @@ void OpenBuy(MqlRates &r[])
    sl = NormalizeDouble(sl, _Digits);
    tp = NormalizeDouble(tp, _Digits);
 
+   // FIX #2: verify SL/TP against the broker's minimum stop distance
+   if(!StopsAreValid(true, ask, sl, tp)) return;
+
    double lots = CalculateLots(riskDistance);
    if(lots <= 0) return;
 
@@ -361,6 +364,9 @@ void OpenSell(MqlRates &r[])
    sl = NormalizeDouble(sl, _Digits);
    tp = NormalizeDouble(tp, _Digits);
 
+   // FIX #2: verify SL/TP against the broker's minimum stop distance
+   if(!StopsAreValid(false, bid, sl, tp)) return;
+
    double lots = CalculateLots(riskDistance);
    if(lots <= 0) return;
 
@@ -370,6 +376,46 @@ void OpenSell(MqlRates &r[])
             " ", trade.ResultRetcodeDescription());
    else
       Print("SELL opened. Lots=", lots, " SL=", sl, " TP=", tp);
+}
+
+//+------------------------------------------------------------------+
+// FIX #2: broker minimum stop-distance validation.
+//
+// SYMBOL_TRADE_STOPS_LEVEL is the minimum distance, in points, that the
+// broker allows between the current price and a stop order. Sending SL/TP
+// inside it makes the order fail with retcode 10016 (Invalid stops).
+// Brokers that report 0 impose no such limit, and this check then passes
+// unchanged, so nothing is altered on those servers.
+//
+// Returns true only when BOTH the SL and the TP clear the minimum.
+//+------------------------------------------------------------------+
+bool StopsAreValid(bool isBuy, double price, double sl, double tp)
+{
+   long   stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist    = (double)stopsLevel*_Point;
+
+   double slDist = isBuy ? (price - sl) : (sl - price);
+   double tpDist = isBuy ? (tp - price) : (price - tp);
+
+   if(slDist < minDist)
+   {
+      Print("Skipped: SL violates broker minimum stop distance. SL is ",
+            DoubleToString(slDist/_Point, 0), " pts from price, broker requires ",
+            stopsLevel, " pts. Price=", DoubleToString(price, _Digits),
+            " SL=", DoubleToString(sl, _Digits));
+      return false;
+   }
+
+   if(tpDist < minDist)
+   {
+      Print("Skipped: TP violates broker minimum stop distance. TP is ",
+            DoubleToString(tpDist/_Point, 0), " pts from price, broker requires ",
+            stopsLevel, " pts. Price=", DoubleToString(price, _Digits),
+            " TP=", DoubleToString(tp, _Digits));
+      return false;
+   }
+
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -396,13 +442,32 @@ double CalculateLots(double stopDistance)
    if(step <= 0) step = minLot;
 
    lots = MathFloor(lots/step)*step;
-   lots = MathMax(minLot, MathMin(maxLot, lots));
+   lots = MathMin(maxLot, lots);   // cap only - capping can never RAISE risk
 
    int volDigits = 2;
    if(step < 0.01)  volDigits = 3;
    if(step < 0.001) volDigits = 4;
 
-   return NormalizeDouble(lots, volDigits);
+   lots = NormalizeDouble(lots, volDigits);
+
+   // FIX #1: never round UP to the broker minimum.
+   // The old code did lots = MathMax(minLot, ...), so whenever the
+   // risk-based size came out below minLot the EA still traded minLot and
+   // silently risked more than RiskPercent. Skipping the trade is the only
+   // way to keep the configured maximum risk honest.
+   if(lots < minLot)
+   {
+      double minLotRiskPct = minLot*moneyPerLot/balance*100.0;
+      Print("Skipped: risk-based lot ", DoubleToString(lots, volDigits),
+            " is below broker minimum ", DoubleToString(minLot, volDigits),
+            ". Trading minLot would risk ", DoubleToString(minLotRiskPct, 2),
+            "% instead of the configured ", DoubleToString(RiskPercent, 2),
+            "% (stop distance ", DoubleToString(stopDistance/_Point, 0),
+            " pts). No trade.");
+      return 0;
+   }
+
+   return lots;
 }
 
 //+------------------------------------------------------------------+
