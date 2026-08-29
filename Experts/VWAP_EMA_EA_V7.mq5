@@ -31,7 +31,7 @@
 //|                                                                  |
 //| Retains every correctness fix from build 6.01.                   |
 //+------------------------------------------------------------------+
-#property version   "7.00"
+#property version   "7.01"
 #property description "Multi-setup M5 EA with per-setup attribution. Research build."
 
 #include <Trade/Trade.mqh>
@@ -151,6 +151,7 @@ ulong  g_ticket = 0;
 int    g_posSetup = -1;
 double g_posEntry = 0.0;
 double g_posRisk  = 0.0;
+double g_posRiskMoney = 0.0;   // FIX 7.01: $ actually risked at ENTRY
 bool   g_posPartialDone = false;
 bool   g_posBEDone = false;
 
@@ -308,11 +309,16 @@ bool VWAPForShift(const int shift, double &vwap, int &bars)
    return false;
 }
 
-//--- how many bars into the session the last closed bar is
-int BarsIntoSession()
+//--- FIX 7.01: the start of the CURRENT trading session, not midnight.
+// The old BarsIntoSession() returned bars since midnight, so with
+// SessionStartHour=10 the ORB window (36 bars) had already expired at
+// 03:00 - seven hours before the session opened. Setup C fired once in
+// 427 days and was never actually tested.
+datetime SessionStartToday(const datetime barTime)
 {
-   if(g_vwapN<=0) return 0;
-   return g_vwapN;
+   datetime ds = DayStartOf(barTime);
+   if(!UseSessionFilter) return ds;
+   return ds + (datetime)(SessionStartHour*3600);
 }
 
 //==================================================
@@ -437,18 +443,18 @@ int SetupORB(const MqlRates &r1,const double fast1,const double fast2,
 {
    if(!UseSetupORB) return 0;
 
-   int barsIn = BarsIntoSession();
-   if(barsIn <= ORBRangeBars) return 0;
-   if(barsIn >  ORBValidBars) return 0;
-
    datetime lastClosed = iTime(_Symbol, EntryTF, 1);
    if(lastClosed==0) return 0;
-   datetime dayStart = DayStartOf(lastClosed);
+
+   // FIX 7.01: everything below is measured from the SESSION start.
+   datetime ss = SessionStartToday(lastClosed);
+   if(lastClosed < ss) return 0;
 
    MqlRates rates[];
    ArraySetAsSeries(rates,false);
-   int copied = CopyRates(_Symbol, EntryTF, dayStart, lastClosed, rates);
-   if(copied < ORBRangeBars+1) return 0;
+   int copied = CopyRates(_Symbol, EntryTF, ss, lastClosed, rates);
+   if(copied <= ORBRangeBars) return 0;   // range still forming
+   if(copied >  ORBValidBars) return 0;   // breakout window expired
 
    double rangeHigh = rates[0].high;
    double rangeLow  = rates[0].low;
@@ -665,6 +671,14 @@ bool TryEnter(const int dir,const int setupId,const MqlRates &r1,const double at
    g_posSetup = setupId;
    g_posEntry = fill;
    g_posRisk  = MathAbs(fill-sl);
+
+   // FIX 7.01: capture the $ risk actually taken, so the R attribution is
+   // not distorted as the account balance changes over the run.
+   double ts_ = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double tv_ = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tv_<=0.0) tv_ = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   g_posRiskMoney = (ts_>0.0 && tv_>0.0 && g_posRisk>0.0)
+                    ? lots*(g_posRisk/ts_)*tv_ : 0.0;
    g_posPartialDone = false;
    g_posBEDone = false;
 
@@ -782,14 +796,16 @@ void SettleClosedPosition()
       if(pl>=0.0) { sWins[s]++;   sGrossWin[s]  += pl;  }
       else        { sLosses[s]++; sGrossLoss[s] += -pl; }
 
-      double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-      double riskMoney = bal*RiskPercent/100.0;
-      if(riskMoney>0.0) sSumR[s] += pl/riskMoney;
+      // FIX 7.01: divide by the risk taken AT ENTRY. The old code used
+      // balance*RiskPercent at CLOSE time, so as the account declined the
+      // divisor shrank and later trades reported inflated R multiples.
+      if(g_posRiskMoney>0.0) sSumR[s] += pl/g_posRiskMoney;
 
       Print("[V7] CLOSED ", sName[s], " | P/L=", DoubleToString(pl,2));
    }
 
    g_ticket=0; g_posSetup=-1; g_posEntry=0.0; g_posRisk=0.0;
+   g_posRiskMoney=0.0;
    g_posPartialDone=false; g_posBEDone=false;
 }
 
