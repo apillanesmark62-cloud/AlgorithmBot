@@ -22,7 +22,7 @@
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD_VWAP_VolumeProfile_V1"
 #property link      "https://github.com/apillanesmark62-cloud/AlgorithmBot"
-#property version   "2.10"
+#property version   "2.11"
 #property description "Educational M5 EA: session VWAP + daily volume profile (POC/VAH/VAL) rejection."
 #property description "Non-repainting, closed-bar only. Fixed fractional risk."
 
@@ -168,6 +168,10 @@ long cVwapNA=0, cProfNA=0, cBiasNone=0, cM15=0, cNoLevel=0, cNoReject=0;
 long cSigLong=0, cSigShort=0, cOpened=0, cRejected=0;
 //--- V2.10: why a signal never became a position
 long hOpenPos=0, hDayCap=0, hDayLoss=0, hSession=0, hSpread=0;
+//--- V2.11: signals lost to the broker minimum lot, and how wide their stops were
+long   hMinLot=0;
+double hMinLotStopSum=0.0, hMinLotStopMax=0.0;
+double hTakenStopSum=0.0;
 
 //+------------------------------------------------------------------+
 //| Logging helpers                                                  |
@@ -312,6 +316,17 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetAsyncMode(false);
    trade.LogLevel(LOG_LEVEL_ERRORS);
+
+   // V2.11: the attribution counters are reset EXACTLY ONCE, here. They used
+   // to be reset inside BuildProfile(), which runs on every closed bar, so
+   // every bucket read zero at the end of every run no matter what traded.
+   lvlName[0]="POC_REJECT"; lvlName[1]="POC_ACCEPT";
+   lvlName[2]="VAH_REJECT"; lvlName[3]="VAH_ACCEPT";
+   lvlName[4]="VAL_REJECT"; lvlName[5]="VAL_ACCEPT";
+   ArrayInitialize(lvlSignals,0); ArrayInitialize(lvlTrades,0);
+   ArrayInitialize(lvlBlocked,0);
+   ArrayInitialize(lvlWins,0);    ArrayInitialize(lvlLosses,0);
+   ArrayInitialize(lvlGrossWin,0.0); ArrayInitialize(lvlGrossLoss,0.0);
 
    g_last_bar = 0;
    UpdateDailyStats();
@@ -538,13 +553,6 @@ bool BuildProfile(ProfileResult &vp)
 
    // ---- pass 2: definition 4, allocate tick volume to bins -------------
    ArrayInitialize(g_bins,0.0);
-   lvlName[0]="POC_REJECT"; lvlName[1]="POC_ACCEPT";
-   lvlName[2]="VAH_REJECT"; lvlName[3]="VAH_ACCEPT";
-   lvlName[4]="VAL_REJECT"; lvlName[5]="VAL_ACCEPT";
-   ArrayInitialize(lvlSignals,0); ArrayInitialize(lvlTrades,0);
-   ArrayInitialize(lvlBlocked,0);
-   ArrayInitialize(lvlWins,0);    ArrayInitialize(lvlLosses,0);
-   ArrayInitialize(lvlGrossWin,0.0); ArrayInitialize(lvlGrossLoss,0.0);
    double total = 0.0;
 
    for(int i=first; i<=last_index; i++)
@@ -863,6 +871,14 @@ double CalculateLotSize(const double entry,const double sl)
 
    if(lots<g_vol_min)
      {
+      // The risk cap is doing its job, but these skips are NOT random: they
+      // remove every setup with a wide stop, so what survives is a biased
+      // sample of unusually tight signal candles. Counted so the bias is
+      // visible in the summary instead of hiding in the trade count.
+      hMinLot++;
+      double sl_pts = sl_distance/g_point;
+      hMinLotStopSum += sl_pts;
+      if(sl_pts>hMinLotStopMax) hMinLotStopMax = sl_pts;
       Reject(StringFormat("risk-correct volume %s is below the broker minimum %s "
                           "(stop %.0f points at %.2f%% risk) - not rounding up",
                           DoubleToString(lots,g_vol_digits),
@@ -875,6 +891,7 @@ double CalculateLotSize(const double entry,const double sl)
       Reject("computed volume exceeds the broker maximum");
       return(0.0);
      }
+   hTakenStopSum += sl_distance/g_point;
    return(lots);
   }
 
@@ -1382,7 +1399,27 @@ void PrintSummary()
    Print("    daily loss limit      : ",hDayLoss);
    Print("    outside session       : ",hSession);
    Print("    spread too wide       : ",hSpread);
+   Print("    below broker min lot  : ",hMinLot);
    Print("  POSITIONS OPENED        : ",cOpened);
+   Print("-------------------------------------------------------------------");
+   if(hMinLot>0)
+     {
+      Print("-------------------------------------------------------------------");
+      Print("SELECTION BIAS WARNING");
+      Print("  ",hMinLot," signal(s) were skipped because the risk-correct lot");
+      Print("  fell below the broker minimum. Those skips are not random - they");
+      Print("  remove the WIDEST stops, so the trades that did open are a biased");
+      Print("  sample of unusually tight signal candles.");
+      Print("  avg stop, skipped : ",
+            DoubleToString(hMinLotStopSum/(double)hMinLot,0)," points");
+      Print("  max stop, skipped : ",DoubleToString(hMinLotStopMax,0)," points");
+      if(cOpened>0)
+         Print("  avg stop, taken   : ",
+               DoubleToString(hTakenStopSum/(double)cOpened,0)," points");
+      Print("  FIX: raise the tester's initial deposit (or the live account) so");
+      Print("  that ",DoubleToString(RiskPercent,2),"% covers these stops at the minimum lot.");
+      Print("  Do NOT fix it by raising RiskPercent - that changes the strategy.");
+     }
    Print("-------------------------------------------------------------------");
    Print("Signal totals must reconcile: sum of per-bucket signals = LONG +");
    Print("SHORT signals, and sum of per-bucket trades = POSITIONS OPENED.");
