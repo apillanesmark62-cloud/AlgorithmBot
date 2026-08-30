@@ -22,7 +22,7 @@
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD_VWAP_VolumeProfile_V1"
 #property link      "https://github.com/apillanesmark62-cloud/AlgorithmBot"
-#property version   "2.11"
+#property version   "2.12"
 #property description "Educational M5 EA: session VWAP + daily volume profile (POC/VAH/VAL) rejection."
 #property description "Non-repainting, closed-bar only. Fixed fractional risk."
 
@@ -75,6 +75,7 @@ input group "=== Risk ==="
 input double RiskPercent          = 0.25;     // Risk per trade (% of equity)
 input double RiskReward           = 2.0;      // Reward : Risk ratio
 input double SLBufferPoints       = 50;       // SL buffer beyond the rejection candle (points)
+input double MaxStopPoints        = 0;        // skip setups whose stop exceeds this (0 = no cap)
 input double MaxLotSize           = 1.0;      // Maximum lot size
 
 input group "=== Daily protection ==="
@@ -161,6 +162,26 @@ double  lvlGrossWin[BUCKETS], lvlGrossLoss[BUCKETS];
 
 ulong   g_ticket    = 0;      // open position being tracked
 int     g_posLevel  = -1;     // which level produced it
+int     g_posBand   = -1;     // V2.12: which stop-width band produced it
+
+//--- V2.12 stop-width attribution. The min-lot guard was silently keeping
+//--- only the tightest stops, and that subset looked profitable. This bands
+//--- every TAKEN trade by its stop width so one run says whether tight stops
+//--- really are better or whether the small sample was just noise.
+#define BANDS 5
+string bandName[BANDS];
+double bandEdge[BANDS] = {5000,10000,15000,20000,1e18};   // upper bound, points
+long   bandTrades[BANDS], bandWins[BANDS], bandLosses[BANDS];
+double bandGrossWin[BANDS], bandGrossLoss[BANDS];
+long   bandCapped=0;          // skipped by MaxStopPoints
+
+int StopBand(const double sl_points)
+  {
+   for(int i=0;i<BANDS;i++)
+      if(sl_points<bandEdge[i])
+         return(i);
+   return(BANDS-1);
+  }
 
 //--- funnel counters
 long cBars=0, cSession=0, cDaily=0, cLoss=0, cOpenPos=0, cSpread=0;
@@ -327,6 +348,15 @@ int OnInit()
    ArrayInitialize(lvlBlocked,0);
    ArrayInitialize(lvlWins,0);    ArrayInitialize(lvlLosses,0);
    ArrayInitialize(lvlGrossWin,0.0); ArrayInitialize(lvlGrossLoss,0.0);
+
+   bandName[0]="stop <  5000 pts";
+   bandName[1]="stop  5-10k pts ";
+   bandName[2]="stop 10-15k pts ";
+   bandName[3]="stop 15-20k pts ";
+   bandName[4]="stop >= 20k pts ";
+   ArrayInitialize(bandTrades,0); ArrayInitialize(bandWins,0);
+   ArrayInitialize(bandLosses,0);
+   ArrayInitialize(bandGrossWin,0.0); ArrayInitialize(bandGrossLoss,0.0);
 
    g_last_bar = 0;
    UpdateDailyStats();
@@ -967,6 +997,17 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
      }
 
    double risk     = MathAbs(entry-sl);
+
+   // V2.12: optional hard cap on stop width. This is a real change to which
+   // setups are traded, so it is OFF by default (MaxStopPoints = 0).
+   if(MaxStopPoints>0.0 && risk>Pts(MaxStopPoints))
+     {
+      bandCapped++;
+      Reject(StringFormat("stop %.0f points exceeds MaxStopPoints %.0f",
+                          risk/g_point,Pts(MaxStopPoints)/g_point));
+      return(false);
+     }
+
    double min_dist = MinStopDistance();
    if(risk<min_dist)
      {
@@ -1034,6 +1075,8 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
    // g_posLevel, so that position's result was credited to the wrong level.
    g_posLevel = bucket;
    if(bucket>=0 && bucket<BUCKETS) lvlTrades[bucket]++;
+   g_posBand = StopBand(risk/g_point);
+   bandTrades[g_posBand]++;
    cOpened++;
 
    Log("-----------------------------------------------------------------");
@@ -1329,8 +1372,16 @@ void SettleClosedPosition()
       Log("Closed "+lvlName[lv]+" trade | P/L="+DoubleToString(pl,2));
      }
 
+   int bd = g_posBand;
+   if(bd>=0 && bd<BANDS)
+     {
+      if(pl>=0.0) { bandWins[bd]++;   bandGrossWin[bd]  += pl;  }
+      else        { bandLosses[bd]++; bandGrossLoss[bd] += -pl; }
+     }
+
    g_ticket   = 0;
    g_posLevel = -1;
+   g_posBand  = -1;
   }
 
 //+------------------------------------------------------------------+
@@ -1383,6 +1434,40 @@ void PrintSummary()
             " PF=",DoubleToString(pf,2),
             " net=",DoubleToString(net,2));
      }
+   Print("-------------------------------------------------------------------");
+   Print("STOP WIDTH vs RESULT  (does the tight-stop subset really perform better?)");
+   Print("Each band is judged against the win rate its OWN realised R:R needs.");
+   for(int b=0;b<BANDS;b++)
+     {
+      long cl = bandWins[b]+bandLosses[b];
+      if(cl==0)
+        {
+         Print("  ",bandName[b]," | trades=",bandTrades[b]," closed=0");
+         continue;
+        }
+      double aw  = (bandWins[b]  >0 ? bandGrossWin[b] /(double)bandWins[b]   : 0.0);
+      double al  = (bandLosses[b]>0 ? bandGrossLoss[b]/(double)bandLosses[b] : 0.0);
+      double rr  = (al>0.0 ? aw/al : 0.0);
+      double be  = (rr>0.0 ? 100.0/(1.0+rr) : 0.0);
+      double wr  = 100.0*bandWins[b]/(double)cl;
+      double pf  = (bandGrossLoss[b]>0.0 ? bandGrossWin[b]/bandGrossLoss[b] : 0.0);
+      // standard error of the break-even proportion at this sample size
+      double se  = (be>0.0 ? 100.0*MathSqrt((be/100.0)*(1.0-be/100.0)/(double)cl) : 0.0);
+      double zz  = (se>0.0 ? (wr-be)/se : 0.0);
+      Print("  ",bandName[b],
+            " | closed=",cl,
+            " win%=",DoubleToString(wr,1),
+            " need=",DoubleToString(be,1),
+            " edge=",DoubleToString(wr-be,1)," pts",
+            " (",DoubleToString(zz,2)," SE)",
+            " PF=",DoubleToString(pf,2),
+            " net=",DoubleToString(bandGrossWin[b]-bandGrossLoss[b],2));
+     }
+   Print("  An edge under 2 SE is noise however good the PF looks. A band with");
+   Print("  fewer than ~30 closed trades cannot clear 2 SE at all - do not act");
+   Print("  on it, pool another date range first.");
+   if(bandCapped>0)
+      Print("  skipped by MaxStopPoints : ",bandCapped);
    Print("-------------------------------------------------------------------");
    Print("Bars evaluated            : ",cBars);
    Print("  VWAP not available      : ",cVwapNA);
