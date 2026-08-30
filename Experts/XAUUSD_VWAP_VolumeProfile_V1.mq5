@@ -22,7 +22,7 @@
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD_VWAP_VolumeProfile_V1"
 #property link      "https://github.com/apillanesmark62-cloud/AlgorithmBot"
-#property version   "2.12"
+#property version   "2.13"
 #property description "Educational M5 EA: session VWAP + daily volume profile (POC/VAH/VAL) rejection."
 #property description "Non-repainting, closed-bar only. Fixed fractional risk."
 
@@ -163,6 +163,7 @@ double  lvlGrossWin[BUCKETS], lvlGrossLoss[BUCKETS];
 ulong   g_ticket    = 0;      // open position being tracked
 int     g_posLevel  = -1;     // which level produced it
 int     g_posBand   = -1;     // V2.12: which stop-width band produced it
+bool    g_posLong   = false;  // V2.13: direction, for the split report
 
 //--- V2.12 stop-width attribution. The min-lot guard was silently keeping
 //--- only the tightest stops, and that subset looked profitable. This bands
@@ -174,6 +175,17 @@ double bandEdge[BANDS] = {5000,10000,15000,20000,1e18};   // upper bound, points
 long   bandTrades[BANDS], bandWins[BANDS], bandLosses[BANDS];
 double bandGrossWin[BANDS], bandGrossLoss[BANDS];
 long   bandCapped=0;          // skipped by MaxStopPoints
+
+//--- V2.13: a per-trade log so the run can split itself in half and show
+//--- whether an effect holds in BOTH halves or lives in one stretch of the
+//--- window. Without a second date range this is the only honest stability
+//--- check available, and it costs one run instead of a tick download.
+#define MAXTRADES 20000
+int      tN=0;
+int      tBucket[MAXTRADES];
+int      tBand[MAXTRADES];
+double   tPL[MAXTRADES];
+bool     tLong[MAXTRADES];
 
 int StopBand(const double sl_points)
   {
@@ -1076,6 +1088,7 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
    g_posLevel = bucket;
    if(bucket>=0 && bucket<BUCKETS) lvlTrades[bucket]++;
    g_posBand = StopBand(risk/g_point);
+   g_posLong = is_long;
    bandTrades[g_posBand]++;
    cOpened++;
 
@@ -1379,9 +1392,92 @@ void SettleClosedPosition()
       else        { bandLosses[bd]++; bandGrossLoss[bd] += -pl; }
      }
 
+   if(tN<MAXTRADES)
+     {
+      tBucket[tN]=lv; tBand[tN]=bd; tPL[tN]=pl; tLong[tN]=g_posLong;
+      tN++;
+     }
+
    g_ticket   = 0;
    g_posLevel = -1;
    g_posBand  = -1;
+  }
+
+//+------------------------------------------------------------------+
+//| V2.13: split the run in half and report a subset in both halves. |
+//|                                                                  |
+//| An effect that is real should survive being cut in two. One that |
+//| lives in a single stretch of the window is a regime, not an edge.|
+//| This is not a substitute for a fresh date range - it shares the  |
+//| same data - but it is the cheapest way to kill a false positive. |
+//+------------------------------------------------------------------+
+void HalfLine(const string label,const int lo,const int hi,
+              const int want_bucket,const int want_band)
+  {
+   long w=0,l=0; double gw=0.0,gl=0.0;
+   for(int i=lo;i<hi;i++)
+     {
+      if(want_bucket>=0 && tBucket[i]!=want_bucket) continue;
+      if(want_band  >=0 && tBand[i]  !=want_band)   continue;
+      if(tPL[i]>=0.0) { w++; gw+=tPL[i]; }
+      else            { l++; gl+=-tPL[i]; }
+     }
+   long n=w+l;
+   if(n==0)
+     {
+      Print("    ",label," | no trades");
+      return;
+     }
+   double pf = (gl>0.0 ? gw/gl : 0.0);
+   Print("    ",label,
+         " | closed=",n,
+         " win%=",DoubleToString(100.0*w/(double)n,1),
+         " PF=",DoubleToString(pf,2),
+         " net=",DoubleToString(gw-gl,2));
+  }
+
+void SplitReport()
+  {
+   if(tN<20)
+     {
+      Print("SPLIT-HALF CHECK: only ",tN," closed trades - not enough to split.");
+      return;
+     }
+   int mid = tN/2;
+   Print("-------------------------------------------------------------------");
+   Print("SPLIT-HALF STABILITY CHECK  (",tN," closed trades, split at ",mid,")");
+   Print("An effect present in ONE half only is a regime, not an edge. Both");
+   Print("halves come from the same window, so agreement is necessary but");
+   Print("NOT sufficient - it can only kill a false positive, never confirm.");
+   Print("  ALL TRADES");
+   HalfLine("1st half",0,mid,-1,-1);
+   HalfLine("2nd half",mid,tN,-1,-1);
+   for(int b=0;b<BANDS;b++)
+     {
+      bool any=false;
+      for(int i=0;i<tN;i++) if(tBand[i]==b) { any=true; break; }
+      if(!any) continue;
+      Print("  ",bandName[b]);
+      HalfLine("1st half",0,mid,-1,b);
+      HalfLine("2nd half",mid,tN,-1,b);
+     }
+   for(int k=0;k<BUCKETS;k++)
+     {
+      bool any=false;
+      for(int i=0;i<tN;i++) if(tBucket[i]==k) { any=true; break; }
+      if(!any) continue;
+      Print("  ",lvlName[k]);
+      HalfLine("1st half",0,mid,k,-1);
+      HalfLine("2nd half",mid,tN,k,-1);
+     }
+   long lw=0,ll=0,sw=0,sl=0;
+   for(int i=0;i<tN;i++)
+     {
+      if(tLong[i]) { if(tPL[i]>=0.0) lw++; else ll++; }
+      else         { if(tPL[i]>=0.0) sw++; else sl++; }
+     }
+   Print("  DIRECTION  longs ",lw,"W/",ll,"L   shorts ",sw,"W/",sl,"L");
+   Print("-------------------------------------------------------------------");
   }
 
 //+------------------------------------------------------------------+
@@ -1509,6 +1605,7 @@ void PrintSummary()
    Print("Signal totals must reconcile: sum of per-bucket signals = LONG +");
    Print("SHORT signals, and sum of per-bucket trades = POSITIONS OPENED.");
    Print("-------------------------------------------------------------------");
+   SplitReport();
    Print("READ THIS: a level with few closed trades proves nothing however");
    Print("good its PF looks. Judge each level on POOLED results from two or");
    Print("more separate date ranges before keeping or deleting it.");
