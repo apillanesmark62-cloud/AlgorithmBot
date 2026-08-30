@@ -163,6 +163,14 @@ candidate for the rejection test.
 When more than one level interacts, the EA evaluates the one **closest to
 `Close[1]`**, so the choice is deterministic.
 
+**V2.10 — `PreferEdgeLevels` (default `true`).** The POC sits in the middle of the
+value area, which is where price spends most of its time, so a plain nearest-level
+search hands the great majority of signals to the POC and the VAH/VAL rule never
+gets tested. With `PreferEdgeLevels = true` the search runs in two passes: VAH and
+VAL first, and the POC only when neither edge interacts. Set it to `false` to
+restore the plain nearest-level search of V2.00. With `UsePOCEntries = false` the
+POC is excluded either way and the switch has no effect.
+
 ### 10. Bullish rejection
 
 At an interacting level `L`, on closed candle 1:

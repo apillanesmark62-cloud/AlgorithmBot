@@ -22,7 +22,7 @@
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD_VWAP_VolumeProfile_V1"
 #property link      "https://github.com/apillanesmark62-cloud/AlgorithmBot"
-#property version   "2.00"
+#property version   "2.10"
 #property description "Educational M5 EA: session VWAP + daily volume profile (POC/VAH/VAL) rejection."
 #property description "Non-repainting, closed-bar only. Fixed fractional risk."
 
@@ -63,6 +63,7 @@ input bool   UseRejectionTrades   = true;     // fade the edge when it rejects
 input bool   UseAcceptanceTrades  = true;     // trade the break when it does NOT reject
 input double AcceptanceBufferPoints = 30;     // how far beyond the edge counts as accepted
 input bool   UsePOCEntries        = false;    // also take rejections at the POC
+input bool   PreferEdgeLevels     = true;     // VAH/VAL win over POC when both are in play
 input bool   UseVWAPDirectionFilter = false;  // require close on the VWAP side of the trade
 input bool   UseM15Filter         = false;    // Require M15 close to agree with M15 VWAP
 
@@ -155,6 +156,7 @@ bool     g_init_ok      = false;
 #define BUCKETS 6
 string  lvlName[BUCKETS];
 long    lvlSignals[BUCKETS], lvlTrades[BUCKETS], lvlWins[BUCKETS], lvlLosses[BUCKETS];
+long    lvlBlocked[BUCKETS];
 double  lvlGrossWin[BUCKETS], lvlGrossLoss[BUCKETS];
 
 ulong   g_ticket    = 0;      // open position being tracked
@@ -164,6 +166,8 @@ int     g_posLevel  = -1;     // which level produced it
 long cBars=0, cSession=0, cDaily=0, cLoss=0, cOpenPos=0, cSpread=0;
 long cVwapNA=0, cProfNA=0, cBiasNone=0, cM15=0, cNoLevel=0, cNoReject=0;
 long cSigLong=0, cSigShort=0, cOpened=0, cRejected=0;
+//--- V2.10: why a signal never became a position
+long hOpenPos=0, hDayCap=0, hDayLoss=0, hSession=0, hSpread=0;
 
 //+------------------------------------------------------------------+
 //| Logging helpers                                                  |
@@ -538,6 +542,7 @@ bool BuildProfile(ProfileResult &vp)
    lvlName[2]="VAH_REJECT"; lvlName[3]="VAH_ACCEPT";
    lvlName[4]="VAL_REJECT"; lvlName[5]="VAL_ACCEPT";
    ArrayInitialize(lvlSignals,0); ArrayInitialize(lvlTrades,0);
+   ArrayInitialize(lvlBlocked,0);
    ArrayInitialize(lvlWins,0);    ArrayInitialize(lvlLosses,0);
    ArrayInitialize(lvlGrossWin,0.0); ArrayInitialize(lvlGrossLoss,0.0);
    double total = 0.0;
@@ -754,20 +759,35 @@ string TradingHaltReason()
       return("symbol trading is disabled");
 
    if(CountOpenPositions()>=MaxOpenPositions)
+     {
+      hOpenPos++;
       return("a position with this magic number is already open");
+     }
    if(MaxTradesPerDay>0 && g_trades_today>=MaxTradesPerDay)
+     {
+      hDayCap++;
       return(StringFormat("daily trade limit reached (%d of %d)",
                           g_trades_today,MaxTradesPerDay));
+     }
    if(MaxDailyLossPercent>0.0 && g_daily_pl_pct<=-MathAbs(MaxDailyLossPercent))
+     {
+      hDayLoss++;
       return(StringFormat("daily loss limit reached (%.2f%%, limit %.2f%%)",
                           g_daily_pl_pct,-MathAbs(MaxDailyLossPercent)));
+     }
    if(!InTradingSession())
+     {
+      hSession++;
       return("outside the trading session");
+     }
 
    double sp = SpreadPoints();
    if(sp>MaxSpreadPoints*g_pt_scale)
+     {
+      hSpread++;
       return(StringFormat("spread too high (%.0f > %.0f broker points)",
                           sp,MaxSpreadPoints*g_pt_scale));
+     }
 
    return("");
   }
@@ -885,7 +905,8 @@ bool MarginIsSufficient(const ENUM_ORDER_TYPE type,const double lots,const doubl
 //| the stop sits beyond them by SLBufferPoints.                     |
 //+------------------------------------------------------------------+
 bool OpenPosition(const bool is_long,const double candle_low,const double candle_high,
-                  const double level,const string level_name,const double target_price)
+                  const double level,const string level_name,const double target_price,
+                  const int bucket)
   {
    string halt = TradingHaltReason();
    if(halt!="")
@@ -991,7 +1012,11 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
          (long)PositionGetInteger(POSITION_MAGIC)==MagicNumber)
         { g_ticket = tk; break; }
      }
-   if(g_posLevel>=0 && g_posLevel<BUCKETS) lvlTrades[g_posLevel]++;
+   // V2.10: the bucket is armed HERE, not at signal time. A signal that is
+   // blocked while an earlier position is still open used to overwrite
+   // g_posLevel, so that position's result was credited to the wrong level.
+   g_posLevel = bucket;
+   if(bucket>=0 && bucket<BUCKETS) lvlTrades[bucket]++;
    cOpened++;
 
    Log("-----------------------------------------------------------------");
@@ -1102,20 +1127,33 @@ void ProcessNewBar()
    levels[LVL_VAH] = vp.vah;
    levels[LVL_VAL] = vp.val;
 
+   // V2.10: the POC sits in the middle of the value area, which is exactly
+   // where price spends most of its time, so a plain nearest-level search
+   // hands almost every signal to the POC and the VAH/VAL rule never gets
+   // tested. With PreferEdgeLevels the edges are searched first and the POC
+   // is only considered when neither edge is in play.
    int    best = -1;
    double best_dist = 0.0;
-   for(int k=0; k<3; k++)
+   for(int pass=0; pass<2; pass++)
      {
-      if(k==LVL_POC && !UsePOCEntries)
-         continue;
-      if(!LevelInteracts(levels[k],c_low,c_high,tol))
-         continue;
-      double dist = MathAbs(c_close-levels[k]);
-      if(best<0 || dist<best_dist)
+      for(int k=0; k<3; k++)
         {
-         best = k;
-         best_dist = dist;
+         bool is_poc = (k==LVL_POC);
+         if(is_poc && !UsePOCEntries)
+            continue;
+         if(PreferEdgeLevels && (is_poc ? pass==0 : pass==1))
+            continue;
+         if(!LevelInteracts(levels[k],c_low,c_high,tol))
+            continue;
+         double dist = MathAbs(c_close-levels[k]);
+         if(best<0 || dist<best_dist)
+           {
+            best = k;
+            best_dist = dist;
+           }
         }
+      if(best>=0 || !PreferEdgeLevels)
+         break;
      }
 
    if(best<0)
@@ -1199,7 +1237,6 @@ void ProcessNewBar()
 
    // ---- attribution bucket: level x kind --------------------------------
    int bucket = best*2 + (is_accept ? 1 : 0);
-   g_posLevel = bucket;
    lvlSignals[bucket]++;
    string lname = lvlName[bucket];
 
@@ -1236,8 +1273,11 @@ void ProcessNewBar()
                     SpreadPoints(),g_trades_today,MaxTradesPerDay,g_daily_pl_pct));
 
    if(want_long) cSigLong++; else cSigShort++;
-   if(!OpenPosition(want_long,c_low,c_high,level,lname,target))
+   if(!OpenPosition(want_long,c_low,c_high,level,lname,target,bucket))
+     {
       cRejected++;
+      lvlBlocked[bucket]++;
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1282,11 +1322,34 @@ void SettleClosedPosition()
 void PrintSummary()
   {
    Print("========== VWAP + VOLUME PROFILE : PER-LEVEL ATTRIBUTION ==========");
+   // V2.10: echo the whole configuration. A journal block that does not say
+   // which switches were on cannot be compared against another run.
    Print("Signal TF = ",EnumToString(SignalTF),
          "   Context TF = ",EnumToString(ContextTF),
          "   ProfileDays = ",ProfileDays,
          "   Rows = ",ProfileRows,
-         "   VA% = ",DoubleToString(ValueAreaPercent,1));
+         "   VA% = ",DoubleToString(ValueAreaPercent,1),
+         "   ExcludeSignalBar = ",ExcludeSignalBarFromProfile);
+   Print("Mode = ",EnumToString(StrategyMode),
+         "   Rejection = ",UseRejectionTrades,
+         "   Acceptance = ",UseAcceptanceTrades,
+         "   POC entries = ",UsePOCEntries,
+         "   PreferEdges = ",PreferEdgeLevels);
+   Print("Tolerance = ",DoubleToString(LevelTolerancePoints,0)," pts",
+         "   AcceptBuffer = ",DoubleToString(AcceptanceBufferPoints,0)," pts",
+         "   VWAP filter = ",UseVWAPDirectionFilter,
+         "   HTF filter = ",UseM15Filter);
+   Print("Target = ",EnumToString(TargetMode),
+         "   MinTargetRR = ",DoubleToString(MinTargetRR,2),
+         "   R:R = ",DoubleToString(RiskReward,2),
+         "   SL buffer = ",DoubleToString(SLBufferPoints,0)," pts");
+   Print("Risk% = ",DoubleToString(RiskPercent,2),
+         "   MaxTrades/day = ",MaxTradesPerDay,
+         "   MaxOpenPos = ",MaxOpenPositions,
+         "   MaxDailyLoss% = ",DoubleToString(MaxDailyLossPercent,2),
+         "   MaxSpread = ",DoubleToString(MaxSpreadPoints,0)," pts");
+   Print("Session = ",TradingSessionStart,":00 -> ",TradingSessionEnd,
+         ":00 server time");
    Print("-------------------------------------------------------------------");
    for(int i=0;i<BUCKETS;i++)
      {
@@ -1296,6 +1359,7 @@ void PrintSummary()
       double net  = lvlGrossWin[i]-lvlGrossLoss[i];
       Print(lvlName[i],
             " | signals=",lvlSignals[i],
+            " blocked=",lvlBlocked[i],
             " trades=",lvlTrades[i],
             " closed=",closed,
             " win%=",DoubleToString(wr,1),
@@ -1313,7 +1377,15 @@ void PrintSummary()
    Print("  LONG signals            : ",cSigLong);
    Print("  SHORT signals           : ",cSigShort);
    Print("  blocked at execution    : ",cRejected);
+   Print("    position already open : ",hOpenPos);
+   Print("    daily trade cap       : ",hDayCap);
+   Print("    daily loss limit      : ",hDayLoss);
+   Print("    outside session       : ",hSession);
+   Print("    spread too wide       : ",hSpread);
    Print("  POSITIONS OPENED        : ",cOpened);
+   Print("-------------------------------------------------------------------");
+   Print("Signal totals must reconcile: sum of per-bucket signals = LONG +");
+   Print("SHORT signals, and sum of per-bucket trades = POSITIONS OPENED.");
    Print("-------------------------------------------------------------------");
    Print("READ THIS: a level with few closed trades proves nothing however");
    Print("good its PF looks. Judge each level on POOLED results from two or");
