@@ -22,7 +22,7 @@
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD_VWAP_VolumeProfile_V1"
 #property link      "https://github.com/apillanesmark62-cloud/AlgorithmBot"
-#property version   "1.10"
+#property version   "2.00"
 #property description "Educational M5 EA: session VWAP + daily volume profile (POC/VAH/VAL) rejection."
 #property description "Non-repainting, closed-bar only. Fixed fractional risk."
 
@@ -42,9 +42,33 @@ input double ValueAreaPercent     = 70.0;     // Value area (% of total volume)
 input int    ProfileMaxBars       = 600;      // signal-TF bars scanned when building the profile
 input bool   ExcludeSignalBarFromProfile = true; // Build levels from bars BEFORE the signal candle
 
+//--- V2.00 strategy modes
+enum ENUM_VP_MODE
+  {
+   VP_MODE_USER   = 0,   // reject the edge = fade it; no rejection = trade the break
+   VP_MODE_TREND  = 1    // v1 behaviour: buy/sell the level as S/R in the VWAP direction
+  };
+
+enum ENUM_TARGET_MODE
+  {
+   TARGET_RR       = 0,  // fixed Reward:Risk
+   TARGET_POC      = 1,  // POC (falls back to RR when POC is the wrong side / too near)
+   TARGET_OPPOSITE = 2   // opposite value-area edge
+  };
+
 input group "=== Signal ==="
+input ENUM_VP_MODE StrategyMode   = VP_MODE_USER; // which rule to trade
 input double LevelTolerancePoints = 30;       // Level interaction tolerance (points)
-input bool   UseM15Filter         = true;     // Require M15 close to agree with M15 VWAP
+input bool   UseRejectionTrades   = true;     // fade the edge when it rejects
+input bool   UseAcceptanceTrades  = true;     // trade the break when it does NOT reject
+input double AcceptanceBufferPoints = 30;     // how far beyond the edge counts as accepted
+input bool   UsePOCEntries        = false;    // also take rejections at the POC
+input bool   UseVWAPDirectionFilter = false;  // require close on the VWAP side of the trade
+input bool   UseM15Filter         = false;    // Require M15 close to agree with M15 VWAP
+
+input group "=== Targets ==="
+input ENUM_TARGET_MODE TargetMode = TARGET_POC; // where rejection trades aim
+input double MinTargetRR          = 1.0;      // level target must be >= this many R, else use RR
 
 input group "=== Risk ==="
 input double RiskPercent          = 0.25;     // Risk per trade (% of equity)
@@ -127,9 +151,11 @@ bool     g_init_ok      = false;
 #define LVL_POC 0
 #define LVL_VAH 1
 #define LVL_VAL 2
-string  lvlName[3];
-long    lvlSignals[3], lvlTrades[3], lvlWins[3], lvlLosses[3];
-double  lvlGrossWin[3], lvlGrossLoss[3];
+//--- V2.00: attribution is per (level x kind): index = level*2 + (accept?1:0)
+#define BUCKETS 6
+string  lvlName[BUCKETS];
+long    lvlSignals[BUCKETS], lvlTrades[BUCKETS], lvlWins[BUCKETS], lvlLosses[BUCKETS];
+double  lvlGrossWin[BUCKETS], lvlGrossLoss[BUCKETS];
 
 ulong   g_ticket    = 0;      // open position being tracked
 int     g_posLevel  = -1;     // which level produced it
@@ -508,7 +534,9 @@ bool BuildProfile(ProfileResult &vp)
 
    // ---- pass 2: definition 4, allocate tick volume to bins -------------
    ArrayInitialize(g_bins,0.0);
-   lvlName[LVL_POC]="POC"; lvlName[LVL_VAH]="VAH"; lvlName[LVL_VAL]="VAL";
+   lvlName[0]="POC_REJECT"; lvlName[1]="POC_ACCEPT";
+   lvlName[2]="VAH_REJECT"; lvlName[3]="VAH_ACCEPT";
+   lvlName[4]="VAL_REJECT"; lvlName[5]="VAL_ACCEPT";
    ArrayInitialize(lvlSignals,0); ArrayInitialize(lvlTrades,0);
    ArrayInitialize(lvlWins,0);    ArrayInitialize(lvlLosses,0);
    ArrayInitialize(lvlGrossWin,0.0); ArrayInitialize(lvlGrossLoss,0.0);
@@ -857,7 +885,7 @@ bool MarginIsSufficient(const ENUM_ORDER_TYPE type,const double lots,const doubl
 //| the stop sits beyond them by SLBufferPoints.                     |
 //+------------------------------------------------------------------+
 bool OpenPosition(const bool is_long,const double candle_low,const double candle_high,
-                  const double level,const string level_name)
+                  const double level,const string level_name,const double target_price)
   {
    string halt = TradingHaltReason();
    if(halt!="")
@@ -910,8 +938,18 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
       return(false);
      }
 
-   double tp = NormalizeDouble(is_long ? entry+risk*RiskReward
-                                       : entry-risk*RiskReward,g_digits);
+   // V2.00: a level target (POC / opposite VA edge) is used when it lies on
+   // the correct side AND is worth at least MinTargetRR; otherwise fall back
+   // to the fixed Reward:Risk so a target 0.2R away can never be taken.
+   double tp = is_long ? entry+risk*RiskReward : entry-risk*RiskReward;
+   if(target_price>0.0)
+     {
+      bool side_ok = (is_long ? target_price>entry : target_price<entry);
+      double tgt_rr = (side_ok && risk>0.0 ? MathAbs(target_price-entry)/risk : 0.0);
+      if(side_ok && tgt_rr>=MinTargetRR)
+         tp = target_price;
+     }
+   tp = NormalizeDouble(tp,g_digits);
    if((is_long && (tp<=entry || (tp-entry)<min_dist))
       || (!is_long && (tp>=entry || (entry-tp)<min_dist)))
      {
@@ -953,7 +991,7 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
          (long)PositionGetInteger(POSITION_MAGIC)==MagicNumber)
         { g_ticket = tk; break; }
      }
-   if(g_posLevel>=0 && g_posLevel<3) lvlTrades[g_posLevel]++;
+   if(g_posLevel>=0 && g_posLevel<BUCKETS) lvlTrades[g_posLevel]++;
    cOpened++;
 
    Log("-----------------------------------------------------------------");
@@ -1028,14 +1066,14 @@ void ProcessNewBar()
       return;
      }
 
-   // ---- definition 3: bias ---------------------------------------------
+   // ---- VWAP bias (used for logging, and only as a FILTER if asked) -----
    string bias = "NONE";
    if(c_close>vwap) bias = "BULLISH";
    if(c_close<vwap) bias = "BEARISH";
 
    if(LogEveryBar)
      {
-      Log(StringFormat("Bar %s | Current price = %s | Bias = %s",
+      Log(StringFormat("Bar %s | price = %s | VWAP bias = %s",
                        TimeToString(c_time,TIME_DATE|TIME_MINUTES),
                        DoubleToString(c_close,g_digits),bias));
       Log(StringFormat("  VWAP = %s (%d bars) | POC = %s | VAH = %s | VAL = %s "
@@ -1047,50 +1085,29 @@ void ProcessNewBar()
                        vp.bars_used));
      }
 
-   // price exactly at VWAP is not traded, in either direction
-   if(bias=="NONE")
-     {
-      cBiasNone++;
-      return;
-     }
+   // ---- candle quality + optional VWAP-side filter ----------------------
+   bool bull_body = (c_close>c_open);
+   bool bear_body = (c_close<c_open);
+   bool vwap_bull = (!UseVWAPDirectionFilter || c_close>vwap);
+   bool vwap_bear = (!UseVWAPDirectionFilter || c_close<vwap);
+   bool bull_ok   = bull_body && vwap_bull;
+   bool bear_ok   = bear_body && vwap_bear;
 
-   bool want_long = (bias=="BULLISH");
-
-   // ---- M15 higher-timeframe context -----------------------------------
-   if(UseM15Filter)
-     {
-      double m15_vwap = 0.0, m15_close = 0.0;
-      int    m15_bars = 0;
-      if(!ComputeSessionVWAP(CONTEXT_TF,300,m15_vwap,m15_bars,m15_close))
-         return;
-
-      bool m15_bull = (m15_close>m15_vwap);
-      bool m15_bear = (m15_close<m15_vwap);
-      if((want_long && !m15_bull) || (!want_long && !m15_bear))
-        {
-         cM15++;
-         if(LogEveryBar)
-            Log(StringFormat("  M15 context disagrees (M15 close %s vs M15 VWAP %s) "
-                             "- no trade",
-                             DoubleToString(m15_close,g_digits),
-                             DoubleToString(m15_vwap,g_digits)));
-         return;
-        }
-     }
-
-   // ---- definition 9: pick the interacting level closest to the close ---
-   double tol = Pts(LevelTolerancePoints);
+   // ---- which value-area level is in play -------------------------------
+   double tol    = Pts(LevelTolerancePoints);
+   double accbuf = Pts(AcceptanceBufferPoints);
 
    double levels[3];
-   string names[3];
-   levels[0] = vp.poc;  names[0] = "POC";
-   levels[1] = vp.vah;  names[1] = "VAH";
-   levels[2] = vp.val;  names[2] = "VAL";
+   levels[LVL_POC] = vp.poc;
+   levels[LVL_VAH] = vp.vah;
+   levels[LVL_VAL] = vp.val;
 
    int    best = -1;
    double best_dist = 0.0;
    for(int k=0; k<3; k++)
      {
+      if(k==LVL_POC && !UsePOCEntries)
+         continue;
       if(!LevelInteracts(levels[k],c_low,c_high,tol))
          continue;
       double dist = MathAbs(c_close-levels[k]);
@@ -1108,59 +1125,118 @@ void ProcessNewBar()
      }
 
    double level = levels[best];
-   string lname = names[best];
-   g_posLevel   = best;          // V1.10: remember which level fired
-   lvlSignals[best]++;
 
-   // ---- definitions 10/11: objective rejection --------------------------
-   bool rejection = false;
-   if(want_long)
-      rejection = (c_low<=level+tol)      // traded down to or through the level
-                  && (c_close>level)      // closed back above it
-                  && (c_close>c_open)     // closed bullish
-                  && (c_close>vwap);      // on the bullish side of VWAP
+   // ---- REJECTION or ACCEPTANCE ----------------------------------------
+   // USER mode, exactly as described:
+   //   VAH tagged and closed back BELOW it        -> rejection  -> SELL
+   //   VAH closed clearly ABOVE it (accepted)     -> breakout   -> BUY
+   //   VAL is the mirror.
+   // The two are mutually exclusive: the acceptance buffer leaves a dead
+   // zone just beyond the edge where neither fires.
+   bool want_long = false;
+   bool is_accept = false;
+   bool have      = false;
+
+   if(StrategyMode==VP_MODE_USER)
+     {
+      if(UseRejectionTrades)
+        {
+         if(best==LVL_VAH && c_high>=level-tol && c_close<level && bear_ok)
+           { want_long=false; is_accept=false; have=true; }
+         else if(best==LVL_VAL && c_low<=level+tol && c_close>level && bull_ok)
+           { want_long=true;  is_accept=false; have=true; }
+         else if(best==LVL_POC)
+           {
+            if(c_low<=level+tol && c_close>level && bull_ok)
+              { want_long=true;  is_accept=false; have=true; }
+            else if(c_high>=level-tol && c_close<level && bear_ok)
+              { want_long=false; is_accept=false; have=true; }
+           }
+        }
+
+      if(!have && UseAcceptanceTrades)
+        {
+         if(best==LVL_VAH && c_close>level+accbuf && bull_ok)
+           { want_long=true;  is_accept=true; have=true; }
+         else if(best==LVL_VAL && c_close<level-accbuf && bear_ok)
+           { want_long=false; is_accept=true; have=true; }
+        }
+     }
    else
-      rejection = (c_high>=level-tol)
-                  && (c_close<level)
-                  && (c_close<c_open)
-                  && (c_close<vwap);
+     {
+      // VP_MODE_TREND - the v1 rule, kept so the two can be compared
+      if(bias=="NONE") { cBiasNone++; return; }
+      want_long = (bias=="BULLISH");
+      bool rejection = want_long
+            ? (c_low<=level+tol  && c_close>level && bull_body && c_close>vwap)
+            : (c_high>=level-tol && c_close<level && bear_body && c_close<vwap);
+      if(rejection) { is_accept=false; have=true; }
+     }
 
-   if(!rejection)
+   if(!have)
      {
       cNoReject++;
       if(LogEveryBar)
-         Log("  VP level interacted with = "+lname
-             +" | Rejection = NO (touch only, no valid rejection close)");
+         Log("  level in play but neither a rejection nor an acceptance close");
       return;
+     }
+
+   // ---- optional higher-timeframe agreement -----------------------------
+   if(UseM15Filter)
+     {
+      double m15_vwap = 0.0, m15_close = 0.0;
+      int    m15_bars = 0;
+      if(!ComputeSessionVWAP(CONTEXT_TF,300,m15_vwap,m15_bars,m15_close))
+         return;
+      bool m15_bull = (m15_close>m15_vwap);
+      bool m15_bear = (m15_close<m15_vwap);
+      if((want_long && !m15_bull) || (!want_long && !m15_bear))
+        {
+         cM15++;
+         return;
+        }
+     }
+
+   // ---- attribution bucket: level x kind --------------------------------
+   int bucket = best*2 + (is_accept ? 1 : 0);
+   g_posLevel = bucket;
+   lvlSignals[bucket]++;
+   string lname = lvlName[bucket];
+
+   // ---- target ----------------------------------------------------------
+   // Level targets only make sense for rejection trades (fading back into
+   // value). A breakout has no level ahead of it, so it always uses R:R.
+   double target = 0.0;
+   if(!is_accept && TargetMode!=TARGET_RR)
+     {
+      if(TargetMode==TARGET_POC && best!=LVL_POC)
+         target = vp.poc;
+      else
+         target = want_long ? vp.vah : vp.val;   // opposite edge
      }
 
    // ---- signal ----------------------------------------------------------
    Log("-----------------------------------------------------------------");
-   Log(StringFormat("%s signal detected on the M5 candle closed at %s",
-                    want_long ? "BUY" : "SELL",
+   Log(StringFormat("%s signal | %s | candle closed %s",
+                    want_long ? "BUY" : "SELL", lname,
                     TimeToString(c_time,TIME_DATE|TIME_MINUTES)));
-   Log("  VWAP = "+DoubleToString(vwap,g_digits)
-       +"  (session VWAP over "+IntegerToString(vwap_bars)+" closed M5 bars)");
-   Log("  POC  = "+DoubleToString(vp.poc,g_digits)
-       +"  | VAH = "+DoubleToString(vp.vah,g_digits)
-       +"  | VAL = "+DoubleToString(vp.val,g_digits));
-   Log(StringFormat("  Profile: %d bars, %d rows, range %s - %s, value area %.1f%%",
-                    vp.bars_used,ProfileRows,
-                    DoubleToString(vp.range_low,g_digits),
-                    DoubleToString(vp.range_high,g_digits),
-                    ValueAreaPercent));
-   Log("  Current price = "+DoubleToString(c_close,g_digits)+"  | Bias = "+bias);
-   Log("  VP level interacted with = "+lname+" ("+DoubleToString(level,g_digits)+")");
-   Log(StringFormat("  Rejection = YES (candle O %s H %s L %s C %s)",
+   Log("  POC = "+DoubleToString(vp.poc,g_digits)
+       +" | VAH = "+DoubleToString(vp.vah,g_digits)
+       +" | VAL = "+DoubleToString(vp.val,g_digits)
+       +" | VWAP = "+DoubleToString(vwap,g_digits));
+   Log(StringFormat("  level %s = %s   candle O %s H %s L %s C %s",
+                    lname,DoubleToString(level,g_digits),
                     DoubleToString(c_open,g_digits),
                     DoubleToString(c_high,g_digits),
                     DoubleToString(c_low,g_digits),
                     DoubleToString(c_close,g_digits)));
-   Log(StringFormat("  Spread = %.0f broker points | trades today %d/%d | daily P/L %.2f%%",
+   Log("  target = "+(target>0.0 ? DoubleToString(target,g_digits)
+                                 : "R:R "+DoubleToString(RiskReward,2)));
+   Log(StringFormat("  Spread = %.0f pts | trades today %d/%d | daily P/L %.2f%%",
                     SpreadPoints(),g_trades_today,MaxTradesPerDay,g_daily_pl_pct));
 
    if(want_long) cSigLong++; else cSigShort++;
-   if(!OpenPosition(want_long,c_low,c_high,level,lname))
+   if(!OpenPosition(want_long,c_low,c_high,level,lname,target))
       cRejected++;
   }
 
@@ -1189,7 +1265,7 @@ void SettleClosedPosition()
      }
 
    int lv = g_posLevel;
-   if(lv>=0 && lv<3)
+   if(lv>=0 && lv<BUCKETS)
      {
       if(pl>=0.0) { lvlWins[lv]++;   lvlGrossWin[lv]  += pl;  }
       else        { lvlLosses[lv]++; lvlGrossLoss[lv] += -pl; }
@@ -1212,7 +1288,7 @@ void PrintSummary()
          "   Rows = ",ProfileRows,
          "   VA% = ",DoubleToString(ValueAreaPercent,1));
    Print("-------------------------------------------------------------------");
-   for(int i=0;i<3;i++)
+   for(int i=0;i<BUCKETS;i++)
      {
       long closed = lvlWins[i]+lvlLosses[i];
       double pf   = (lvlGrossLoss[i]>0.0 ? lvlGrossWin[i]/lvlGrossLoss[i] : 0.0);
