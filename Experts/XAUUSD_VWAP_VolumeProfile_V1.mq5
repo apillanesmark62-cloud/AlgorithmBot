@@ -22,7 +22,7 @@
 //+------------------------------------------------------------------+
 #property copyright "XAUUSD_VWAP_VolumeProfile_V1"
 #property link      "https://github.com/apillanesmark62-cloud/AlgorithmBot"
-#property version   "1.00"
+#property version   "1.10"
 #property description "Educational M5 EA: session VWAP + daily volume profile (POC/VAH/VAL) rejection."
 #property description "Non-repainting, closed-bar only. Fixed fractional risk."
 
@@ -31,11 +31,15 @@
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
+input group "=== Timeframes ==="
+input ENUM_TIMEFRAMES SignalTF    = PERIOD_M5;   // signal timeframe
+input ENUM_TIMEFRAMES ContextTF   = PERIOD_M15;  // higher-timeframe VWAP context
+
 input group "=== Volume profile ==="
 input int    ProfileDays          = 1;        // Days included in the profile (1 = today)
 input int    ProfileRows          = 100;      // Number of price bins
 input double ValueAreaPercent     = 70.0;     // Value area (% of total volume)
-input int    ProfileMaxBars       = 600;      // M5 bars scanned when building the profile
+input int    ProfileMaxBars       = 600;      // signal-TF bars scanned when building the profile
 input bool   ExcludeSignalBarFromProfile = true; // Build levels from bars BEFORE the signal candle
 
 input group "=== Signal ==="
@@ -70,8 +74,11 @@ input bool   LogEveryBar          = false;    // Log VWAP/POC/VAH/VAL every clos
 //+------------------------------------------------------------------+
 //| Constants                                                        |
 //+------------------------------------------------------------------+
-#define SIGNAL_TF   PERIOD_M5
-#define CONTEXT_TF  PERIOD_M15
+// V1.10: the timeframes were hardcoded to M5/M15. Testing has shown the
+// spread is ~21% of an M5 stop but only ~3% of an H1 stop, so the ability
+// to run this on H1 matters more than any parameter in the file.
+#define SIGNAL_TF   SignalTF
+#define CONTEXT_TF  ContextTF
 
 //+------------------------------------------------------------------+
 //| Result of one volume-profile build (scalars only)                |
@@ -115,6 +122,22 @@ int      g_trades_today = 0;
 double   g_daily_pl_pct = 0.0;
 
 bool     g_init_ok      = false;
+
+//--- V1.10 per-LEVEL attribution (diagnostics only, never read by a decision)
+#define LVL_POC 0
+#define LVL_VAH 1
+#define LVL_VAL 2
+string  lvlName[3];
+long    lvlSignals[3], lvlTrades[3], lvlWins[3], lvlLosses[3];
+double  lvlGrossWin[3], lvlGrossLoss[3];
+
+ulong   g_ticket    = 0;      // open position being tracked
+int     g_posLevel  = -1;     // which level produced it
+
+//--- funnel counters
+long cBars=0, cSession=0, cDaily=0, cLoss=0, cOpenPos=0, cSpread=0;
+long cVwapNA=0, cProfNA=0, cBiasNone=0, cM15=0, cNoLevel=0, cNoReject=0;
+long cSigLong=0, cSigShort=0, cOpened=0, cRejected=0;
 
 //+------------------------------------------------------------------+
 //| Logging helpers                                                  |
@@ -300,6 +323,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
+   PrintSummary();
    ArrayFree(g_bins);
   }
 
@@ -484,6 +508,10 @@ bool BuildProfile(ProfileResult &vp)
 
    // ---- pass 2: definition 4, allocate tick volume to bins -------------
    ArrayInitialize(g_bins,0.0);
+   lvlName[LVL_POC]="POC"; lvlName[LVL_VAH]="VAH"; lvlName[LVL_VAL]="VAL";
+   ArrayInitialize(lvlSignals,0); ArrayInitialize(lvlTrades,0);
+   ArrayInitialize(lvlWins,0);    ArrayInitialize(lvlLosses,0);
+   ArrayInitialize(lvlGrossWin,0.0); ArrayInitialize(lvlGrossLoss,0.0);
    double total = 0.0;
 
    for(int i=first; i<=last_index; i++)
@@ -898,8 +926,8 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
    if(!MarginIsSufficient(is_long ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,lots,entry))
       return(false);
 
-   bool sent = (is_long ? trade.Buy(lots,_Symbol,0.0,sl,tp,TradeComment)
-                        : trade.Sell(lots,_Symbol,0.0,sl,tp,TradeComment));
+   bool sent = (is_long ? trade.Buy(lots,_Symbol,0.0,sl,tp,level_name)
+                        : trade.Sell(lots,_Symbol,0.0,sl,tp,level_name));
    uint code = trade.ResultRetcode();
 
    if(!sent || (code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_DONE_PARTIAL
@@ -914,6 +942,19 @@ bool OpenPosition(const bool is_long,const double candle_low,const double candle
    double fill = trade.ResultPrice();
    if(fill<=0.0)
       fill = entry;
+
+   // V1.10: remember the ticket so the result can be attributed to its level
+   g_ticket = 0;
+   for(int i=PositionsTotal()-1;i>=0;--i)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk==0) continue;
+      if(PositionGetString(POSITION_SYMBOL)==_Symbol &&
+         (long)PositionGetInteger(POSITION_MAGIC)==MagicNumber)
+        { g_ticket = tk; break; }
+     }
+   if(g_posLevel>=0 && g_posLevel<3) lvlTrades[g_posLevel]++;
+   cOpened++;
 
    Log("-----------------------------------------------------------------");
    Log(StringFormat("Trade opened: %s %s at %s",
@@ -951,6 +992,7 @@ bool LevelInteracts(const double level,const double c_low,const double c_high,
 //+------------------------------------------------------------------+
 void ProcessNewBar()
   {
+   cBars++;
    UpdateDailyStats();
 
    // ---- the closed signal candle ---------------------------------------
@@ -970,6 +1012,7 @@ void ProcessNewBar()
    int    vwap_bars = 0;
    if(!ComputeSessionVWAP(SIGNAL_TF,ProfileMaxBars,vwap,vwap_bars,vwap_close))
      {
+      cVwapNA++;
       if(LogEveryBar)
          Log("Session VWAP not available yet (no closed bars in this day).");
       return;
@@ -979,6 +1022,7 @@ void ProcessNewBar()
    ProfileResult vp;
    if(!BuildProfile(vp) || !vp.valid)
      {
+      cProfNA++;
       if(LogEveryBar)
          Log("Volume profile not available yet (too few closed bars in the window).");
       return;
@@ -1005,7 +1049,10 @@ void ProcessNewBar()
 
    // price exactly at VWAP is not traded, in either direction
    if(bias=="NONE")
+     {
+      cBiasNone++;
       return;
+     }
 
    bool want_long = (bias=="BULLISH");
 
@@ -1021,6 +1068,7 @@ void ProcessNewBar()
       bool m15_bear = (m15_close<m15_vwap);
       if((want_long && !m15_bull) || (!want_long && !m15_bear))
         {
+         cM15++;
          if(LogEveryBar)
             Log(StringFormat("  M15 context disagrees (M15 close %s vs M15 VWAP %s) "
                              "- no trade",
@@ -1054,10 +1102,15 @@ void ProcessNewBar()
      }
 
    if(best<0)
-      return;                                       // no level in play, no trade
+     {
+      cNoLevel++;
+      return;                                      // no level in play, no trade
+     }
 
    double level = levels[best];
    string lname = names[best];
+   g_posLevel   = best;          // V1.10: remember which level fired
+   lvlSignals[best]++;
 
    // ---- definitions 10/11: objective rejection --------------------------
    bool rejection = false;
@@ -1074,6 +1127,7 @@ void ProcessNewBar()
 
    if(!rejection)
      {
+      cNoReject++;
       if(LogEveryBar)
          Log("  VP level interacted with = "+lname
              +" | Rejection = NO (touch only, no valid rejection close)");
@@ -1105,7 +1159,90 @@ void ProcessNewBar()
    Log(StringFormat("  Spread = %.0f broker points | trades today %d/%d | daily P/L %.2f%%",
                     SpreadPoints(),g_trades_today,MaxTradesPerDay,g_daily_pl_pct));
 
-   OpenPosition(want_long,c_low,c_high,level,lname);
+   if(want_long) cSigLong++; else cSigShort++;
+   if(!OpenPosition(want_long,c_low,c_high,level,lname))
+      cRejected++;
+  }
+
+//+------------------------------------------------------------------+
+//| V1.10: attribute a closed position to the level that produced it |
+//+------------------------------------------------------------------+
+void SettleClosedPosition()
+  {
+   if(g_ticket==0)
+      return;
+   if(PositionSelectByTicket(g_ticket))
+      return;                                   // still open
+
+   double pl = 0.0;
+   if(HistorySelectByPosition(g_ticket))
+     {
+      int n = HistoryDealsTotal();
+      for(int i=0;i<n;i++)
+        {
+         ulong tk = HistoryDealGetTicket(i);
+         if(tk==0) continue;
+         pl += HistoryDealGetDouble(tk,DEAL_PROFIT)
+             + HistoryDealGetDouble(tk,DEAL_SWAP)
+             + HistoryDealGetDouble(tk,DEAL_COMMISSION);
+        }
+     }
+
+   int lv = g_posLevel;
+   if(lv>=0 && lv<3)
+     {
+      if(pl>=0.0) { lvlWins[lv]++;   lvlGrossWin[lv]  += pl;  }
+      else        { lvlLosses[lv]++; lvlGrossLoss[lv] += -pl; }
+      Log("Closed "+lvlName[lv]+" trade | P/L="+DoubleToString(pl,2));
+     }
+
+   g_ticket   = 0;
+   g_posLevel = -1;
+  }
+
+//+------------------------------------------------------------------+
+//| V1.10: end-of-run funnel + per-level attribution                 |
+//+------------------------------------------------------------------+
+void PrintSummary()
+  {
+   Print("========== VWAP + VOLUME PROFILE : PER-LEVEL ATTRIBUTION ==========");
+   Print("Signal TF = ",EnumToString(SignalTF),
+         "   Context TF = ",EnumToString(ContextTF),
+         "   ProfileDays = ",ProfileDays,
+         "   Rows = ",ProfileRows,
+         "   VA% = ",DoubleToString(ValueAreaPercent,1));
+   Print("-------------------------------------------------------------------");
+   for(int i=0;i<3;i++)
+     {
+      long closed = lvlWins[i]+lvlLosses[i];
+      double pf   = (lvlGrossLoss[i]>0.0 ? lvlGrossWin[i]/lvlGrossLoss[i] : 0.0);
+      double wr   = (closed>0 ? 100.0*lvlWins[i]/closed : 0.0);
+      double net  = lvlGrossWin[i]-lvlGrossLoss[i];
+      Print(lvlName[i],
+            " | signals=",lvlSignals[i],
+            " trades=",lvlTrades[i],
+            " closed=",closed,
+            " win%=",DoubleToString(wr,1),
+            " PF=",DoubleToString(pf,2),
+            " net=",DoubleToString(net,2));
+     }
+   Print("-------------------------------------------------------------------");
+   Print("Bars evaluated            : ",cBars);
+   Print("  VWAP not available      : ",cVwapNA);
+   Print("  profile not available   : ",cProfNA);
+   Print("  price sitting on VWAP   : ",cBiasNone);
+   Print("  higher-TF context vetoed: ",cM15);
+   Print("  no level interaction    : ",cNoLevel);
+   Print("  level touched, NO reject: ",cNoReject);
+   Print("  LONG signals            : ",cSigLong);
+   Print("  SHORT signals           : ",cSigShort);
+   Print("  blocked at execution    : ",cRejected);
+   Print("  POSITIONS OPENED        : ",cOpened);
+   Print("-------------------------------------------------------------------");
+   Print("READ THIS: a level with few closed trades proves nothing however");
+   Print("good its PF looks. Judge each level on POOLED results from two or");
+   Print("more separate date ranges before keeping or deleting it.");
+   Print("===================================================================");
   }
 
 //+------------------------------------------------------------------+
@@ -1115,6 +1252,9 @@ void OnTick()
   {
    if(!g_init_ok)
       return;
+
+   SettleClosedPosition();
+
    if(!IsNewBar())
       return;
 
